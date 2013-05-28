@@ -4,6 +4,7 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <time.h>
 
 struct reg_info {
   char *name;
@@ -18,6 +19,35 @@ static short *mem_16 = 0;
 static char  *mem_8  = 0;
 static int *prev_mem_range = 0;
 
+#define FPGA_W_TEST0       0x08040000
+#define FPGA_W_TEST1       0x08040002
+#define FPGA_W_GPIOA_DOUT  0x08040010
+#define FPGA_W_GPIOA_DIR   0x08040012
+
+#define FPGA_W_DDR3_P2_CMD  0x08040020
+#define FPGA_W_DDR3_P2_LADR 0x08040022
+#define FPGA_W_DDR3_P2_HADR 0x08040024
+#define FPGA_W_DDR3_P2_WEN  0x08040026
+#define FPGA_W_DDR3_P2_LDAT 0x08040028
+#define FPGA_W_DDR3_P2_HDAT 0x0804002A
+
+#define FPGA_W_DDR3_P3_CMD  0x08040030
+#define FPGA_W_DDR3_P3_LADR 0x08040032
+#define FPGA_W_DDR3_P3_HADR 0x08040034
+#define FPGA_W_DDR3_P3_REN  0x08040036
+
+#define FPGA_R_TEST0        0x08041000
+#define FPGA_R_TEST1        0x08041002
+#define FPGA_R_DDR3_CAL     0x08041004
+#define FPGA_R_GPIOA_DIN    0x08041010
+
+#define FPGA_R_DDR3_P2_STAT 0x08041020
+#define FPGA_R_DDR3_P3_STAT 0x08041030
+#define FPGA_R_DDR3_P3_LDAT 0x08041032
+#define FPGA_R_DDR3_P3_HDAT 0x08041034
+
+#define FPGA_R_DDR3_V_MINOR 0x08041FFC
+#define FPGA_R_DDR3_V_MAJOR 0x08041FFE
 
 int read_kernel_memory(long offset, int virtualized, int size) {
   int result;
@@ -292,7 +322,7 @@ void setup_fpga() {
   // 0000 0100 0000 0000 0000  0100 0000 0000
   //  0    4    0    0     0    4     0    0
 
-  write_kernel_memory( 0x21b8010, 0x09080600, 0, 4 );
+  write_kernel_memory( 0x21b8010, 0x09080800, 0, 4 );
 
   // EIM_WCR
   // BCM = 1   free-run BCLK
@@ -306,6 +336,236 @@ void setup_fpga() {
   printf( "done.\n" );
 }
 
+void gpio_test() {
+  write_kernel_memory( 0x08040012, 0xFF, 0, 2 );
+  while(1) {
+    write_kernel_memory( 0x08040010, 0xFF, 0, 2 );
+  }
+}
+
+void ddr3_setadr(unsigned int port, unsigned int adr) {
+  unsigned short offset = 0;
+  if( port == 2)
+    offset = 0;
+  else if( port == 3)
+    offset = 0x10;
+  else {
+    printf( "only ports 2 and 3 supported.\n" );
+    return;
+  }
+  
+  write_kernel_memory( FPGA_W_DDR3_P2_LADR + offset, (adr & 0xFFFF), 0, 2 );
+  write_kernel_memory( FPGA_W_DDR3_P2_HADR + offset, (adr >> 16) & 0xFFFF, 0, 2 );
+}
+
+void ddr3_writedata(unsigned int data) {
+  write_kernel_memory( FPGA_W_DDR3_P2_LDAT, (data & 0xFFFF), 0, 2 );
+  write_kernel_memory( FPGA_W_DDR3_P2_HDAT, (data >> 16) & 0xFFFF, 0, 2 );
+}
+
+void ddr3_status() {
+  unsigned short rv;
+  unsigned int data;
+
+  rv = read_kernel_memory(FPGA_R_DDR3_CAL, 0, 2);
+  printf( "DDR3 pll " );
+  if( rv & 0x1 )   printf( "lock" ); else  printf( "unlock" );
+  printf( " cal " );
+  if( rv & 0x2 )   printf( "done" ); else printf( "not done" );
+  printf( "\n" );
+
+  rv = read_kernel_memory(FPGA_R_DDR3_P2_STAT, 0, 2);
+  printf( "P2 wr count: %d ", (rv >> 8) & 0x7F );
+  if( rv & 0x20 )    printf( "cmd_empty " );
+  if( rv & 0x10 )    printf( "cmd_full " );
+  if( rv & 0x8 )    printf( "q_full " );
+  if( rv & 0x4 )    printf( "q_empty " );
+  if( rv & 0x2 )    printf( "q_underrun " );
+  if( rv & 0x1 )    printf( "q_error " );
+  printf( "\n" );
+
+  rv = read_kernel_memory(FPGA_R_DDR3_P3_STAT, 0, 2);
+  printf( "P3 rd count: %d, ", (rv >> 8) & 0x7F );
+  if( rv & 0x20 )    printf( "cmd_empty " );
+  if( rv & 0x10 )    printf( "cmd_full " );
+  if( rv & 0x8 )    printf( "q_full " );
+  if( rv & 0x4 )    printf( "q_empty " );
+  if( rv & 0x2 )    printf( "q_underrun " );
+  if( rv & 0x1 )    printf( "q_error " );
+
+  rv = read_kernel_memory(FPGA_R_DDR3_P3_LDAT, 0, 2);
+  data = (unsigned int) rv;
+  rv = read_kernel_memory(FPGA_R_DDR3_P3_HDAT, 0, 2);
+  data |= (rv << 16);
+  printf( " read: %08x\n", data );
+
+}
+
+void ddr3_writecmd() {
+  ddr3_status();
+  printf( "* write data to FIFO\n" );
+  write_kernel_memory( FPGA_W_DDR3_P2_WEN, 0x10, 0, 2 );
+  write_kernel_memory( FPGA_W_DDR3_P2_WEN, 0x00, 0, 2 );
+  ddr3_status();
+  printf( "* issue write command\n" );
+  write_kernel_memory( FPGA_W_DDR3_P2_CMD, 0x008, 0, 2 );
+  write_kernel_memory( FPGA_W_DDR3_P2_CMD, 0x000, 0, 2 );
+  ddr3_status();
+}
+
+void ddr3_readcmd() {
+  ddr3_status();
+  printf( "* issue read command\n" );
+  write_kernel_memory( FPGA_W_DDR3_P3_CMD, 0x001, 0, 2 );
+  write_kernel_memory( FPGA_W_DDR3_P3_CMD, 0x009, 0, 2 );
+  write_kernel_memory( FPGA_W_DDR3_P3_CMD, 0x001, 0, 2 );
+  ddr3_status();
+  printf( "* advance read queue\n" );
+  write_kernel_memory( FPGA_W_DDR3_P3_REN, 0x10, 0, 2 );
+  write_kernel_memory( FPGA_W_DDR3_P3_REN, 0x00, 0, 2 );
+  ddr3_status();
+  
+}
+
+#define DDR3_SIZE (1024 * 1024 * 4)  // in words (4 bytes per word)
+#define DDR3_FIFODEPTH 64
+
+void ddr3_test() {
+  unsigned int *testdat;
+  unsigned int readback[DDR3_FIFODEPTH];
+  int i;
+  int burstaddr = 0;
+  unsigned int data;
+  int iters = 0;
+  int offset;
+  unsigned int rv;
+  unsigned int arg = 0;
+
+  srand(time(NULL)); // seed the random generator
+
+  testdat = calloc(DDR3_SIZE, sizeof(unsigned int));
+  if( testdat == NULL ) {
+    printf( "Can't allocate test array.\n" );
+    return;
+  }
+
+  while(1) {
+    // dummy writes to clear any previous data in the queue -- caution, writes to "wherever"!
+    while( !(read_kernel_memory(FPGA_R_DDR3_P2_STAT, 0, 2) & 4) ) {
+      write_kernel_memory( FPGA_W_DDR3_P2_CMD, 0x008, 0, 2 );
+      write_kernel_memory( FPGA_W_DDR3_P2_CMD, 0x000, 0, 2 );
+    }
+    // dummy reads to clear any previous data in the queue
+    while( !(read_kernel_memory(FPGA_R_DDR3_P3_STAT, 0, 2) & 4) ) {
+      write_kernel_memory( FPGA_W_DDR3_P3_REN, 0x010, 0, 2 );
+      write_kernel_memory( FPGA_W_DDR3_P3_REN, 0x000, 0, 2 );
+    }
+
+    putchar('+'); fflush(stdout);
+    for( i = 0; i < DDR3_SIZE; i++ ) {
+      testdat[i] = (unsigned int) rand();
+    }
+    
+    offset = 0;
+    burstaddr = 0;
+    write_kernel_memory( FPGA_W_DDR3_P2_LADR + offset, ((burstaddr * 4) & 0xFFFF), 0, 2 );
+    write_kernel_memory( FPGA_W_DDR3_P2_HADR + offset, ((burstaddr * 4) >> 16) & 0xFFFF, 0, 2 );
+
+    putchar('!'); fflush(stdout);
+    while( burstaddr < DDR3_SIZE ) {
+      while( !(read_kernel_memory(FPGA_R_DDR3_P2_STAT, 0, 2) & 4) ) {
+	putchar('-'); fflush(stdout);  // wait for write queue to be empty
+      }
+      for( i = 0; i < DDR3_FIFODEPTH; i++ ) {
+	write_kernel_memory( FPGA_W_DDR3_P2_LDAT, (testdat[burstaddr + i] & 0xFFFF), 0, 2 );
+	write_kernel_memory( FPGA_W_DDR3_P2_HDAT, (testdat[burstaddr + i] >> 16) & 0xFFFF, 0, 2 );
+	write_kernel_memory( FPGA_W_DDR3_P2_WEN, 0x10, 0, 2 );
+	write_kernel_memory( FPGA_W_DDR3_P2_WEN, 0x00, 0, 2 );
+      }
+      if( (read_kernel_memory(FPGA_R_DDR3_P2_STAT, 0, 2) >> 8) != DDR3_FIFODEPTH ) {
+	printf( "z%d\n", (read_kernel_memory(FPGA_R_DDR3_P2_STAT, 0, 2) >> 8) );
+	putchar('z'); fflush(stdout);
+      }
+      arg = ((DDR3_FIFODEPTH - 1) << 4);
+      write_kernel_memory( FPGA_W_DDR3_P2_CMD, arg, 0, 2 );
+      arg |= 8;
+      write_kernel_memory( FPGA_W_DDR3_P2_CMD, arg, 0, 2 );
+      write_kernel_memory( FPGA_W_DDR3_P2_CMD, 0x000, 0, 2 );
+      burstaddr += DDR3_FIFODEPTH;
+      write_kernel_memory( FPGA_W_DDR3_P2_LADR + offset, ((burstaddr * 4) & 0xFFFF), 0, 2 );
+      write_kernel_memory( FPGA_W_DDR3_P2_HADR + offset, ((burstaddr * 4) >> 16) & 0xFFFF, 0, 2 );
+    }
+    
+    offset = 0x10; // accessing port 3 (read port)
+    burstaddr = 0;
+    write_kernel_memory( FPGA_W_DDR3_P2_LADR + offset, ((burstaddr * 4) & 0xFFFF), 0, 2 );
+    write_kernel_memory( FPGA_W_DDR3_P2_HADR + offset, ((burstaddr * 4) >> 16) & 0xFFFF, 0, 2 );
+
+    putchar('.'); fflush(stdout);
+
+    while( burstaddr < DDR3_SIZE ) {
+#if 1
+      arg = ((DDR3_FIFODEPTH - 1) << 4) | 1;
+      write_kernel_memory( FPGA_W_DDR3_P3_CMD, arg, 0, 2 );
+      arg |= 0x8;
+      write_kernel_memory( FPGA_W_DDR3_P3_CMD, arg, 0, 2 );
+      arg &= ~0x8;
+      write_kernel_memory( FPGA_W_DDR3_P3_CMD, arg, 0, 2 );
+      for( i = 0; i < DDR3_FIFODEPTH; i++ ) {
+	while( (read_kernel_memory(FPGA_R_DDR3_P3_STAT, 0, 2) & 4) ) {
+	  putchar('i'); fflush(stdout);// wait for queue to become full before reading
+	}
+	rv = read_kernel_memory(FPGA_R_DDR3_P3_HDAT, 0, 2);
+	data = (rv << 16);
+	rv = read_kernel_memory(FPGA_R_DDR3_P3_LDAT, 0, 2);
+	data |= ((unsigned int) rv) & 0xFFFF;
+	readback[i] = data;
+	write_kernel_memory( FPGA_W_DDR3_P3_REN, 0x10, 0, 2 );
+	write_kernel_memory( FPGA_W_DDR3_P3_REN, 0x00, 0, 2 );
+      }
+#else
+      for( i = 0; i < DDR3_FIFODEPTH; i++ ) { 
+	write_kernel_memory( FPGA_W_DDR3_P2_LADR + offset, 
+			     (((burstaddr + i) * 4) & 0xFFFF), 0, 2 );
+	write_kernel_memory( FPGA_W_DDR3_P2_HADR + offset, 
+			     (((burstaddr + i) * 4) >> 16) & 0xFFFF, 0, 2 );
+	write_kernel_memory( FPGA_W_DDR3_P3_CMD, 1, 0, 2 ); // single beat reads
+	write_kernel_memory( FPGA_W_DDR3_P3_CMD, 9, 0, 2 );
+	write_kernel_memory( FPGA_W_DDR3_P3_CMD, 1, 0, 2 );
+	while( ((read_kernel_memory(FPGA_R_DDR3_P3_STAT, 0, 2) >> 8) == 0) ) {
+	  putchar('i'); fflush(stdout);// wait for queue to become full before reading
+	}
+	rv = read_kernel_memory(FPGA_R_DDR3_P3_HDAT, 0, 2);
+	data = (rv << 16);
+	rv = read_kernel_memory(FPGA_R_DDR3_P3_LDAT, 0, 2);
+	data |= ((unsigned int) rv) & 0xFFFF;
+	readback[i] = data;
+	write_kernel_memory( FPGA_W_DDR3_P3_REN, 0x10, 0, 2 );
+	write_kernel_memory( FPGA_W_DDR3_P3_REN, 0x00, 0, 2 );
+      }
+#endif
+      while( !(read_kernel_memory(FPGA_R_DDR3_P3_STAT, 0, 2) & 0x4) ) {
+	putchar('x'); fflush(stdout); // error, should be empty now
+	write_kernel_memory( FPGA_W_DDR3_P3_REN, 0x10, 0, 2 );
+	write_kernel_memory( FPGA_W_DDR3_P3_REN, 0x00, 0, 2 );
+      }
+      for( i = 0; i < DDR3_FIFODEPTH; i++ ) {
+	if( testdat[burstaddr + i] != readback[i] ) {
+	  printf( "\n%08x: %08x(w) %08x(r)", burstaddr + i, testdat[burstaddr + i], readback[i] );
+	}
+      }
+      burstaddr += DDR3_FIFODEPTH;
+      write_kernel_memory( FPGA_W_DDR3_P2_LADR + offset, ((burstaddr * 4) & 0xFFFF), 0, 2 );
+      write_kernel_memory( FPGA_W_DDR3_P2_HADR + offset, ((burstaddr * 4) >> 16) & 0xFFFF, 0, 2 );
+    }
+
+    if( !(iters % 16) ) {
+      printf( "\n%d iterations\n", iters );
+    }
+    iters++;
+  }
+}
+
 int main(int argc, char **argv) {
   int          dump_registers = 0;
   unsigned int read_offset    = 0;
@@ -314,6 +574,7 @@ int main(int argc, char **argv) {
   int          virtualized    = 0;
   int          ch;
   int fd;
+  unsigned int a1, a2;
 
   char *prog = argv[0];
   argv++;
@@ -339,6 +600,65 @@ int main(int argc, char **argv) {
       argc--;
       argv++;
       test_fpga();
+    }
+    else if(!strcmp(*argv, "-v")) {
+      argc--;
+      argv++;
+      printf( "FPGA version code: %04hx.%04hx\n", 
+	      read_kernel_memory(FPGA_R_DDR3_V_MINOR, 0, 2),
+	      read_kernel_memory(FPGA_R_DDR3_V_MAJOR, 0, 2) );
+    }
+    else if(!strcmp(*argv, "-ds")) { // ddr3 status
+      argc--;
+      argv++;
+      ddr3_status();
+    }
+    else if(!strcmp(*argv, "-da")) { // ddr3 address
+      argc--;
+      argv++;
+      if( argc != 2 ) {
+	printf( "usage: -da <port> <address>\n" );
+	return 1;
+      }
+      a1 = strtoul(*argv, NULL, 10);
+      argc--;
+      argv++;
+      a2 = strtoul(*argv, NULL, 16);
+      argc--;
+      argv++;
+      ddr3_setadr(a1, a2);
+    }
+    else if(!strcmp(*argv, "-dd")) { // ddr3 write data
+      argc--;
+      argv++;
+      if( argc != 1 ) {
+	printf( "usage: -dd <data>\n" );
+	return 1;
+      }
+      a1 = strtoul(*argv, NULL, 16);
+      argc--;
+      argv++;
+      ddr3_writedata(a1);
+    }
+    else if(!strcmp(*argv, "-dw")) { // ddr3 issue write command
+      argc--;
+      argv++;
+      ddr3_writecmd();
+    }
+    else if(!strcmp(*argv, "-dr")) { // ddr3 issue read command
+      argc--;
+      argv++;
+      ddr3_readcmd();
+    }
+    else if(!strcmp(*argv, "-dt")) { // ddr3 stress test
+      argc--;
+      argv++;
+      ddr3_test();
+    }
+    else if(!strcmp(*argv, "-tg")) { // test gio
+      argc--;
+      argv++;
+      gpio_test();
     }
     else {
       print_usage(prog);
