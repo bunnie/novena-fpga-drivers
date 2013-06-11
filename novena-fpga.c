@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <time.h>
 #include "gpio.h"
+#include "sd.h"
 
 /** Definitions for Novena EIM interface */
 #define CS_PIN    GPIO_IS_EIM | 3
@@ -20,6 +21,15 @@ struct reg_info {
   int size;
   char *description;
 };
+
+extern int pkt_send_hello(struct sd *sd);
+extern int pkt_send_reset(struct sd *sd);
+extern int pkt_send_nand_cycle(struct sd *sd, uint32_t nsec, uint32_t sec, uint8_t data, uint8_t ctrl, uint8_t unk[2]);
+extern int send_cmdX(struct sd_state *state, 
+		     uint8_t cmd,
+		     uint8_t a1, uint8_t a2, uint8_t a3, uint8_t a4,
+		     int print_size);
+extern void init_packet_log(int filedesc);
 
 static int fd = 0;
 static int   *mem_32 = 0;
@@ -78,6 +88,8 @@ static int *prev_mem_range = 0;
 #define FPGA_R_NAND_ADR_STAT 0x08041108
 #define FPGA_R_NAND_ADR_LOW  0x0804110A
 #define FPGA_R_NAND_ADR_HI   0x0804110C // this auto-advances the queue
+
+#define FPGA_R_NAND_DDR_STAT 0x0804110E
 
 #define FPGA_R_LOG_STAT     0x08041200
 #define FPGA_R_LOG_ENTRY_L  0x08041202
@@ -172,9 +184,7 @@ int read_kernel_memory(long offset, int virtualized, int size) {
 #define TEST_LEN 32768
 
 void test_fpga(void) {
-  int result;
   volatile unsigned short *cs0;
-  volatile unsigned short dummy;
   int i;
   unsigned short test[TEST_LEN];
   unsigned short tval;
@@ -883,7 +893,6 @@ void rom_address2() {
 void rom_dump() {
   int i;
   volatile unsigned short *cs0;
-  int errors = 0;
 
   if(mem_32)
     munmap(mem_32, 0xFFFF);
@@ -958,7 +967,6 @@ void rom_upload2(int infile) {  // upload with ECC holes
   int bytes, i;
   unsigned short data[ROM_SIZE];
   volatile unsigned short *cs0;
-  int errors = 0;
 
   printf( "uploading a ROM with holes for ECC\n" );
   for( i = 0; i < ROM_SIZE; i++ ) 
@@ -1038,13 +1046,13 @@ void rom_verify(int infile) {
 #define LOGENTRY_LEN 8
 #define FIFOWIDTH 4
 
+#define CONFIG_SD 1
+
 void log_dump(int ofd, unsigned int records) {
-  unsigned int *testdat;
   unsigned int readback[DDR3_FIFODEPTH];
   int i;
   int burstaddr = 0;
   unsigned int data;
-  int iters = 0;
   int offset;
   unsigned int rv;
   unsigned int arg = 0;
@@ -1054,6 +1062,7 @@ void log_dump(int ofd, unsigned int records) {
   unsigned char ctrl;
   unsigned int sec, nsec;
   unsigned char buf[12];
+  unsigned int log_start;
 
   if(mem_32)
     munmap(mem_32, 0xFFFF);
@@ -1071,14 +1080,22 @@ void log_dump(int ofd, unsigned int records) {
   cs0 = (volatile unsigned short *)mem_32;
 
   offset = 0x10; // accessing port 3 (read port)
-  burstaddr = 0;
+#if CONFIG_SD
+  printf( "Note: configured for 'SD' style tap boards & FPGA config\n" );
+  burstaddr = 0x0F000000; // log starts at 16MB for non-sandisk version
+  log_start = 0x0F000000;
+#else
+  printf( "Note: configured for 'Sandisk' style tap boards & FPGA config\n" );
+  burstaddr = 0x0; // sandisk version
+  log_start = 0x0;
+#endif
   cs0[FPGA_MAP(FPGA_W_DDR3_P2_LADR + offset)] = ((burstaddr * 4) & 0xFFFF);
   cs0[FPGA_MAP(FPGA_W_DDR3_P2_HADR + offset)] = ((burstaddr * 4) >> 16) & 0xFFFF;
 
   records = records - 1; // I think there's a fencepost error somewhere...
   printf( "dumping %d records", records );
 
-  while( burstaddr < (records * LOGENTRY_LEN / FIFOWIDTH) ) {
+  while( burstaddr < (records * LOGENTRY_LEN / FIFOWIDTH + log_start) ) {
     arg = ((DDR3_FIFODEPTH - 1) << 4) | 1;
     cs0[FPGA_MAP(FPGA_W_DDR3_P3_CMD)] =  arg | PULSE_GATE_MASK;
     arg |= 0x8;
@@ -1136,15 +1153,14 @@ void log_dump(int ofd, unsigned int records) {
     cs0[FPGA_MAP( FPGA_W_DDR3_P2_HADR + offset )] = ((burstaddr * 4) >> 16) & 0xFFFF;
   }
   printf( "\n" );
+  printf( "Note to self: this log needs to be parsed with https://github.com/xobs/novena-tbraw\n" );
 }
 
 void dump_ddr3(unsigned int address, unsigned int len) {
-  unsigned int *testdat;
   unsigned int readback[DDR3_FIFODEPTH];
   int i;
   int burstaddr = 0;
   unsigned int data;
-  int iters = 0;
   int offset;
   unsigned int rv;
   unsigned int arg = 0;
@@ -1205,12 +1221,10 @@ void dump_ddr3(unsigned int address, unsigned int len) {
 }
 
 void write_log(unsigned int count) {
-  unsigned int *testdat;
   unsigned int readback[DDR3_FIFODEPTH];
   int i;
   int burstaddr = 0;
   unsigned int data;
-  int iters = 0;
   int offset;
   unsigned int rv;
   unsigned int arg = 0;
@@ -1259,7 +1273,7 @@ void write_log(unsigned int count) {
       // now prepare nsec, sec values:
       // bits 31-23 are LSB of nsec
       // 1111 1111 1_111 1111 . 1111 1111 1111 1111
-      nsec = (readback[i] & 0x7FFFFF) << 9 | (readback[i] >> 23) & 0x1FF;
+      nsec = ((readback[i] & 0x7FFFFF) << 9) | ((readback[i] >> 23) & 0x1FF);
       sec = (readback[i] >> 23) & 0x1FF;
       pkt_send_nand_cycle(NULL, nsec, sec, d, ctrl, unk);
     }
@@ -1357,7 +1371,7 @@ void log_test() {
   pkt_send_hello(NULL);
   state = sd_init(MISO_PIN, MOSI_PIN, CLK_PIN, CS_PIN, POWER_PIN);
   if (!state)
-    return 1;
+    return;
   pkt_send_reset((struct sd *)state);
   sd_reset(state, 2);
 
@@ -1388,7 +1402,7 @@ void log_test() {
   log_entries |= cs0[FPGA_MAP(FPGA_R_LOG_ENTRY_H)] << 16;
   log_stat = cs0[FPGA_MAP(FPGA_R_LOG_STAT)];
 
-  printf( "log entries: %ld\n", log_entries );
+  printf( "log entries: %ud\n", log_entries );
   if( log_stat & 0x1 )
     printf( "Note: data fifo overflowed\n" );
   if( log_stat & 0x2 )
@@ -1445,7 +1459,7 @@ void log_test() {
   log_entries |= cs0[FPGA_MAP(FPGA_R_LOG_ENTRY_H)] << 16;
   log_stat = cs0[FPGA_MAP(FPGA_R_LOG_STAT)];
 
-  printf( "log entries: %ld\n", log_entries );
+  printf( "log entries: %ud\n", log_entries );
   if( log_stat & 0x1 )
     printf( "Note: data fifo overflowed\n" );
   if( log_stat & 0x2 )
@@ -1580,7 +1594,6 @@ void g_getid() {
 void funkychicken() {
   volatile unsigned short *cs0;
   cs0 = (volatile unsigned short *)mem_32;
-  int i;
 
   cs0[F(FPGA_W_GPIOB_DOUT)] &= 0xFF00;
   cs0[F(FPGA_W_GPIOB_DOUT)] |= (0x15);
@@ -1618,7 +1631,7 @@ void funkychicken() {
   g_cs();
 }
 
-bang_read(unsigned int row, unsigned int col, unsigned char *buf, unsigned int len) {
+void bang_read(unsigned int row, unsigned int col, unsigned char *buf, unsigned int len) {
   int i;
 
   g_cs();
@@ -1665,7 +1678,7 @@ bang_read(unsigned int row, unsigned int col, unsigned char *buf, unsigned int l
 
 void bangtest(int ofd) {
   volatile unsigned short *cs0;
-  char data[MAXDEPTH];
+  unsigned char data[MAXDEPTH];
   int i;
   struct sd_state *state;
   
@@ -1693,9 +1706,9 @@ void bangtest(int ofd) {
   usleep(10000); // wait for the MCU to shut down before driving pins
 
 #if 1
-  state = sd_init(MISO_PIN, MOSI_PIN, CLK_PIN, CS_PIN, POWER_PIN);
+  state = (struct sd_state *) sd_init(MISO_PIN, MOSI_PIN, CLK_PIN, CS_PIN, POWER_PIN);
   if (!state)
-    return 1;
+    return;
   sd_reset(state, 2);
 
   printf("CSD:\n");
@@ -1806,7 +1819,7 @@ void bangtest(int ofd) {
       fflush(stdout);
     }
     memset(data, 0x42, MAXDEPTH); // clear the data array to 0x42 so i can identify mis-reads
-    bang_read( i, 0, data, MAXDEPTH ); // row col format
+    bang_read( i, 0, data, (unsigned int) MAXDEPTH ); // row col format
     write(ofd, data, COLDEPTH);
   }
   printf( "done\n" );
@@ -1824,14 +1837,115 @@ void bangtest(int ofd) {
   cs0[F(FPGA_W_GPIOB_DIR)] = 0x0000; // turn off all overrides
 }
 
+void ddr3load(int ifd) {
+  volatile unsigned short *cs0;
+  unsigned int *buf;
+  unsigned int actual;
+  int burstaddr = 0;
+  int i;
+  unsigned int arg = 0;
+  int offset;
+
+  setup_fpga();
+
+  if(mem_32)
+    munmap(mem_32, 0xFFFF);
+  if(fd)
+    close(fd);
+
+  fd = open("/dev/mem", O_RDWR);
+  if( fd < 0 ) {
+    perror("Unable to open /dev/mem");
+    fd = 0;
+    return;
+  }
+
+  mem_32 = mmap(0, 0xffff, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0x08040000);
+  cs0 = (volatile unsigned short *)mem_32;
+
+  buf = calloc(256 * 1024 * 1024 / 4, 4);
+  if( buf == NULL ) {
+    printf( "Unable to allocate 256MB shadow area. Yell at bunnie for making crappy code.\n" );
+    return;
+  }
+  actual = read(ifd, buf, 256 * 1024 * 1024);
+  actual = actual / 4;
+  printf( "Writing %x 32-bit words\n", actual );
+  if( (actual % 64) != 0 )
+    printf( "Warning: number of bytes being written is not divisible by 64\n" );
+
+  // dummy writes to clear any previous data in the queue -- caution, writes to "wherever"!
+  while( !(cs0[FPGA_MAP(FPGA_R_DDR3_P2_STAT)] & 4) ) {
+    cs0[FPGA_MAP(FPGA_W_DDR3_P2_CMD)] =  0x008 | PULSE_GATE_MASK;
+    cs0[FPGA_MAP(FPGA_W_DDR3_P2_CMD)] =  0x000 | PULSE_GATE_MASK;
+  }
+  // dummy reads to clear any previous data in the queue
+  while( !(cs0[FPGA_MAP(FPGA_R_DDR3_P3_STAT)] & 4) ) {
+    cs0[FPGA_MAP(FPGA_W_DDR3_P3_REN)] =  0x010;
+    cs0[FPGA_MAP(FPGA_W_DDR3_P3_REN)] =  0x000;
+  }
+
+  putchar('+'); fflush(stdout);
+    
+  offset = 0;
+  burstaddr = 0;
+  cs0[FPGA_MAP(FPGA_W_DDR3_P2_LADR + offset)] = ((burstaddr * 4) & 0xFFFF);
+  cs0[FPGA_MAP(FPGA_W_DDR3_P2_HADR + offset)] = ((burstaddr * 4) >> 16) & 0xFFFF;
+
+  putchar('!'); fflush(stdout);
+  while( burstaddr < actual ) {
+    if( (burstaddr % (1024 * 1024)) == 0 ) {
+      printf( "." );
+      fflush(stdout);
+    }
+    while( !(cs0[FPGA_MAP(FPGA_R_DDR3_P2_STAT)] & 4) ) {
+      putchar('-'); fflush(stdout);  // wait for write queue to be empty
+    }
+    for( i = 0; i < DDR3_FIFODEPTH; i++ ) {
+      cs0[FPGA_MAP(FPGA_W_DDR3_P2_LDAT)] = (buf[burstaddr + i] & 0xFFFF);
+      cs0[FPGA_MAP(FPGA_W_DDR3_P2_HDAT)] = (buf[burstaddr + i] >> 16) & 0xFFFF;
+    }
+    if( (cs0[FPGA_MAP(FPGA_R_DDR3_P2_STAT)] >> 8) != DDR3_FIFODEPTH ) {
+      printf( "z%d\n", cs0[FPGA_MAP(FPGA_R_DDR3_P2_STAT)] >> 8 );
+      putchar('z'); fflush(stdout);
+    }
+    arg = ((DDR3_FIFODEPTH - 1) << 4);
+    cs0[FPGA_MAP(FPGA_W_DDR3_P2_CMD)] =  arg | PULSE_GATE_MASK;
+    arg |= 8;
+    cs0[FPGA_MAP(FPGA_W_DDR3_P2_CMD)] =  arg | PULSE_GATE_MASK;
+    cs0[FPGA_MAP(FPGA_W_DDR3_P2_CMD)] = 0x000 | PULSE_GATE_MASK;
+    burstaddr += DDR3_FIFODEPTH;
+    cs0[FPGA_MAP(FPGA_W_DDR3_P2_LADR + offset)] = ((burstaddr * 4) & 0xFFFF);
+    cs0[FPGA_MAP(FPGA_W_DDR3_P2_HADR + offset)] = ((burstaddr * 4) >> 16) & 0xFFFF;
+  }
+  printf( "\n" );
+
+}
+
+void romreset() {
+  volatile unsigned short *cs0;
+
+  if(mem_32)
+    munmap(mem_32, 0xFFFF);
+  if(fd)
+    close(fd);
+
+  fd = open("/dev/mem", O_RDWR);
+  if( fd < 0 ) {
+    perror("Unable to open /dev/mem");
+    fd = 0;
+    return;
+  }
+
+  mem_32 = mmap(0, 0xffff, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0x08040000);
+  cs0 = (volatile unsigned short *)mem_32;
+
+  cs0[F(FPGA_W_NAND_UK_CTL)] = 0x0036;
+  usleep(1);
+  cs0[F(FPGA_W_NAND_UK_CTL)] = 0x0000;
+}
+
 int main(int argc, char **argv) {
-  int          dump_registers = 0;
-  unsigned int read_offset    = 0;
-  unsigned int write_offset   = 0;
-  unsigned int write_value    = 0;
-  int          virtualized    = 0;
-  int          ch;
-  int fd;
   unsigned int a1, a2;
   int infile;
 
@@ -2056,6 +2170,26 @@ int main(int argc, char **argv) {
       argc--;
       argv++;
       bangtest(infile);
+    }
+    else if(!strcmp(*argv, "-ddr3load")) { // dump DDR3 to screen
+      argc--;
+      argv++;
+      if( argc != 1 ) {
+	printf( "usage -ddr3load <file>\n" );
+	return 1;
+      }
+      infile = open(*argv, O_RDONLY );
+      if( infile == -1 ) {
+	printf("Unable to open %s\n", *argv );
+	return 1;
+      }
+      argc--;
+      argv++;
+      ddr3load(infile);
+    } else if(!strcmp(*argv, "-romreset")) {
+      argc--;
+      argv++;
+      romreset(infile);
     }
     else {
       print_usage(prog);
