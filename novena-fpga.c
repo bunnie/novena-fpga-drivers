@@ -1048,7 +1048,217 @@ void rom_verify(int infile) {
 
 #define CONFIG_SD 1
 
-void log_dump(int ofd, unsigned int records) {
+static void trace_printline(uint8_t data, uint8_t ctrl, uint32_t nsec, uint32_t sec) {
+  static int i = 0;
+  printf( "Packet %6d:   ", i );
+  if( ctrl & 0x1 )
+    printf( " ALE" );
+  else 
+    printf( "    " );
+  if(ctrl & 0x2)
+    printf( " CLE" );
+  else
+    printf( "    " );
+  if((ctrl & 0x4) == 0)
+    printf( "  WE" );
+  else
+    printf( "    " );
+  if((ctrl & 0x8) == 0)
+    printf( "  RE" );
+  else
+    printf( "    " );
+  if((ctrl & 0x10) == 0)
+    printf( "  CS" );
+  else 
+    printf( "    " );
+
+  printf( " %02x  .  %u.%u\n", data, sec, nsec );
+
+  i++;
+}
+
+void log_dump(int ofd, unsigned int records, int verbose) {
+  unsigned int readback[DDR3_FIFODEPTH];
+  int i;
+  int burstaddr = 0;
+  unsigned int data;
+  int offset;
+  unsigned int rv;
+  unsigned int arg = 0;
+  volatile unsigned short *cs0;
+  unsigned char d;
+  unsigned char unk[2];
+  unsigned char ctrl;
+  unsigned int sec, nsec;
+  unsigned char buf[12];
+  unsigned int log_start;
+
+  if(mem_32)
+    munmap(mem_32, 0xFFFF);
+  if(fd)
+    close(fd);
+
+  fd = open("/dev/mem", O_RDWR);
+  if( fd < 0 ) {
+    perror("Unable to open /dev/mem");
+    fd = 0;
+    return;
+  }
+
+  mem_32 = mmap(0, 0xffff, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0x08040000);
+  cs0 = (volatile unsigned short *)mem_32;
+
+  offset = 0x10; // accessing port 3 (read port)
+#if CONFIG_SD
+  printf( "Note: configured for 'SD' style tap boards & FPGA config\n" );
+  burstaddr = 0x0F000000 / 4; // log starts at 16MB for non-sandisk version
+  log_start = 0x0F000000 / 4;
+#else
+  printf( "Note: configured for 'Sandisk' style tap boards & FPGA config\n" );
+  burstaddr = 0x0; // sandisk version
+  log_start = 0x0;
+#endif
+  cs0[FPGA_MAP(FPGA_W_DDR3_P2_LADR + offset)] = ((burstaddr * 4) & 0xFFFF);
+  cs0[FPGA_MAP(FPGA_W_DDR3_P2_HADR + offset)] = ((burstaddr * 4) >> 16) & 0xFFFF;
+
+
+  if( records > 0 )
+    records = records - 1; // I think there's a fencepost error somewhere...
+  printf( "dumping %u records", records );
+  if( verbose ) printf( "\n" );
+
+  while( burstaddr < (records * LOGENTRY_LEN / FIFOWIDTH + log_start) ) {
+    arg = ((DDR3_FIFODEPTH - 1) << 4) | 1;
+    cs0[FPGA_MAP(FPGA_W_DDR3_P3_CMD)] =  arg | PULSE_GATE_MASK;
+    arg |= 0x8;
+    cs0[FPGA_MAP(FPGA_W_DDR3_P3_CMD)] =  arg | PULSE_GATE_MASK;
+    arg &= ~0x8;
+    cs0[FPGA_MAP(FPGA_W_DDR3_P3_CMD)] = arg | PULSE_GATE_MASK;
+    for( i = 0; i < DDR3_FIFODEPTH; i++ ) {
+      while( (cs0[FPGA_MAP(FPGA_R_DDR3_P3_STAT)] & 4) ) {
+	putchar('i'); fflush(stdout);// wait for queue to become full before reading
+      }
+      rv = cs0[FPGA_MAP(FPGA_R_DDR3_P3_LDAT)];
+      data = ((unsigned int) rv) & 0xFFFF;
+      rv = cs0[FPGA_MAP(FPGA_R_DDR3_P3_HDAT)];
+      data |= (rv << 16);
+      readback[i] = data;
+    }
+    while( !(cs0[FPGA_MAP(FPGA_R_DDR3_P3_STAT)] & 0x4) ) {
+      putchar('x'); fflush(stdout); // error, should be empty now
+      cs0[FPGA_MAP( FPGA_W_DDR3_P3_REN )] = 0x10;
+      cs0[FPGA_MAP( FPGA_W_DDR3_P3_REN )] = 0x00;
+    }
+    for( i = 0; i < DDR3_FIFODEPTH; i += 2 ) {
+      d = readback[i] & 0xFF;
+      ctrl = (readback[i] >> 8) & 0x1F; // control is already lined up by FPGA mapping
+      unk[0] = ((readback[i] >> 13) & 0xFF);
+      unk[1] = ((readback[i] >> 21) & 0x3);
+      // now prepare nsec, sec values:
+      // bits 31-23 are LSB of nsec
+      // 1111 1111 1_111 1111 . 1111 1111 1111 1111
+      nsec = ((readback[i+1] & 0x7FFFFF) << 9) | ((readback[i] >> 23) & 0x1FF);
+      sec = (readback[i+1] >> 23) & 0x1FF;
+      buf[0] = d;
+      buf[1] = ctrl;
+      buf[2] = unk[0];
+      buf[3] = unk[1];
+      //      nsec = ntohl(nsec);
+      //      sec = ntohl(sec);
+      memcpy( buf+4, &nsec, 4 );
+      memcpy( buf+8, &sec, 4 );
+      //      write(ofd, &d, 1);
+      //      write(ofd, &ctrl, 1);
+      //      write(ofd, unk, 2);
+      //      write(ofd, &nsec, 4);
+      //      write(ofd, &sec, 4);
+      if( (burstaddr + i + 1) < (records * LOGENTRY_LEN / FIFOWIDTH) )
+	write( ofd, buf, 12 );
+
+      if( verbose )
+	trace_printline(d, ctrl, nsec, sec);
+    }
+    if( !verbose ) {
+      if( (burstaddr % (1024 * 128)) == 0 ) {
+	printf( "." );
+	fflush(stdout);
+      }
+    }
+
+    burstaddr += DDR3_FIFODEPTH;
+    cs0[FPGA_MAP( FPGA_W_DDR3_P2_LADR + offset )] = ((burstaddr * 4) & 0xFFFF);
+    cs0[FPGA_MAP( FPGA_W_DDR3_P2_HADR + offset )] = ((burstaddr * 4) >> 16) & 0xFFFF;
+  }
+  printf( "\n" );
+  printf( "Note to self: this log needs to be parsed with https://github.com/xobs/novena-tbraw\n" );
+}
+
+void dump_ddr3(unsigned int address, unsigned int len) {
+  unsigned int readback[DDR3_FIFODEPTH];
+  int i;
+  int burstaddr = 0;
+  unsigned int data;
+  int offset;
+  unsigned int rv;
+  unsigned int arg = 0;
+  volatile unsigned short *cs0;
+
+  if(mem_32)
+    munmap(mem_32, 0xFFFF);
+  if(fd)
+    close(fd);
+
+  fd = open("/dev/mem", O_RDWR);
+  if( fd < 0 ) {
+    perror("Unable to open /dev/mem");
+    fd = 0;
+    return;
+  }
+
+  mem_32 = mmap(0, 0xffff, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0x08040000);
+  cs0 = (volatile unsigned short *)mem_32;
+
+  offset = 0x10; // accessing port 3 (read port)
+  burstaddr = address / 4;
+  cs0[FPGA_MAP(FPGA_W_DDR3_P2_LADR + offset)] = ((burstaddr * 4) & 0xFFFF);
+  cs0[FPGA_MAP(FPGA_W_DDR3_P2_HADR + offset)] = ((burstaddr * 4) >> 16) & 0xFFFF;
+
+  while( burstaddr < (address + len) / 4 ) {
+    arg = ((DDR3_FIFODEPTH - 1) << 4) | 1;
+    cs0[FPGA_MAP(FPGA_W_DDR3_P3_CMD)] =  arg | PULSE_GATE_MASK;
+    arg |= 0x8;
+    cs0[FPGA_MAP(FPGA_W_DDR3_P3_CMD)] =  arg | PULSE_GATE_MASK;
+    arg &= ~0x8;
+    cs0[FPGA_MAP(FPGA_W_DDR3_P3_CMD)] = arg | PULSE_GATE_MASK;
+    for( i = 0; i < DDR3_FIFODEPTH; i++ ) {
+      while( (cs0[FPGA_MAP(FPGA_R_DDR3_P3_STAT)] & 4) ) {
+	putchar('i'); fflush(stdout);// wait for queue to become full before reading
+      }
+      rv = cs0[FPGA_MAP(FPGA_R_DDR3_P3_LDAT)];
+      data = ((unsigned int) rv) & 0xFFFF;
+      rv = cs0[FPGA_MAP(FPGA_R_DDR3_P3_HDAT)];
+      data |= (rv << 16);
+      readback[i] = data;
+    }
+    while( !(cs0[FPGA_MAP(FPGA_R_DDR3_P3_STAT)] & 0x4) ) {
+      putchar('x'); fflush(stdout); // error, should be empty now
+      cs0[FPGA_MAP( FPGA_W_DDR3_P3_REN )] = 0x10;
+      cs0[FPGA_MAP( FPGA_W_DDR3_P3_REN )] = 0x00;
+    }
+    for( i = 0; i < DDR3_FIFODEPTH; i++ ) {
+      if( (i % 8) == 0 )
+	printf( "\n%08x: ", (burstaddr + i) * 4 );
+      printf( "%08x ", readback[i] );
+    }
+    burstaddr += DDR3_FIFODEPTH;
+    cs0[FPGA_MAP( FPGA_W_DDR3_P2_LADR + offset )] = ((burstaddr * 4) & 0xFFFF);
+    cs0[FPGA_MAP( FPGA_W_DDR3_P2_HADR + offset )] = ((burstaddr * 4) >> 16) & 0xFFFF;
+  }
+  printf( "\n" );
+
+}
+
+void log_trace(int ofd, unsigned int records) {
   unsigned int readback[DDR3_FIFODEPTH];
   int i;
   int burstaddr = 0;
@@ -1156,138 +1366,6 @@ void log_dump(int ofd, unsigned int records) {
   printf( "Note to self: this log needs to be parsed with https://github.com/xobs/novena-tbraw\n" );
 }
 
-void dump_ddr3(unsigned int address, unsigned int len) {
-  unsigned int readback[DDR3_FIFODEPTH];
-  int i;
-  int burstaddr = 0;
-  unsigned int data;
-  int offset;
-  unsigned int rv;
-  unsigned int arg = 0;
-  volatile unsigned short *cs0;
-
-  if(mem_32)
-    munmap(mem_32, 0xFFFF);
-  if(fd)
-    close(fd);
-
-  fd = open("/dev/mem", O_RDWR);
-  if( fd < 0 ) {
-    perror("Unable to open /dev/mem");
-    fd = 0;
-    return;
-  }
-
-  mem_32 = mmap(0, 0xffff, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0x08040000);
-  cs0 = (volatile unsigned short *)mem_32;
-
-  offset = 0x10; // accessing port 3 (read port)
-  burstaddr = address;
-  cs0[FPGA_MAP(FPGA_W_DDR3_P2_LADR + offset)] = ((burstaddr * 4) & 0xFFFF);
-  cs0[FPGA_MAP(FPGA_W_DDR3_P2_HADR + offset)] = ((burstaddr * 4) >> 16) & 0xFFFF;
-
-  while( burstaddr < address + len ) {
-    arg = ((DDR3_FIFODEPTH - 1) << 4) | 1;
-    cs0[FPGA_MAP(FPGA_W_DDR3_P3_CMD)] =  arg | PULSE_GATE_MASK;
-    arg |= 0x8;
-    cs0[FPGA_MAP(FPGA_W_DDR3_P3_CMD)] =  arg | PULSE_GATE_MASK;
-    arg &= ~0x8;
-    cs0[FPGA_MAP(FPGA_W_DDR3_P3_CMD)] = arg | PULSE_GATE_MASK;
-    for( i = 0; i < DDR3_FIFODEPTH; i++ ) {
-      while( (cs0[FPGA_MAP(FPGA_R_DDR3_P3_STAT)] & 4) ) {
-	putchar('i'); fflush(stdout);// wait for queue to become full before reading
-      }
-      rv = cs0[FPGA_MAP(FPGA_R_DDR3_P3_LDAT)];
-      data = ((unsigned int) rv) & 0xFFFF;
-      rv = cs0[FPGA_MAP(FPGA_R_DDR3_P3_HDAT)];
-      data |= (rv << 16);
-      readback[i] = data;
-    }
-    while( !(cs0[FPGA_MAP(FPGA_R_DDR3_P3_STAT)] & 0x4) ) {
-      putchar('x'); fflush(stdout); // error, should be empty now
-      cs0[FPGA_MAP( FPGA_W_DDR3_P3_REN )] = 0x10;
-      cs0[FPGA_MAP( FPGA_W_DDR3_P3_REN )] = 0x00;
-    }
-    for( i = 0; i < DDR3_FIFODEPTH; i++ ) {
-      if( (i % 8) == 0 )
-	printf( "\n%08x: ", burstaddr + i );
-      printf( "%08x ", readback[i] );
-    }
-    burstaddr += DDR3_FIFODEPTH;
-    cs0[FPGA_MAP( FPGA_W_DDR3_P2_LADR + offset )] = ((burstaddr * 4) & 0xFFFF);
-    cs0[FPGA_MAP( FPGA_W_DDR3_P2_HADR + offset )] = ((burstaddr * 4) >> 16) & 0xFFFF;
-  }
-
-}
-
-void write_log(unsigned int count) {
-  unsigned int readback[DDR3_FIFODEPTH];
-  int i;
-  int burstaddr = 0;
-  unsigned int data;
-  int offset;
-  unsigned int rv;
-  unsigned int arg = 0;
-  volatile unsigned short *cs0;
-
-  unsigned char d;
-  unsigned char unk[2];
-  unsigned char ctrl;
-  unsigned int sec, nsec;
-
-  cs0 = (volatile unsigned short *)mem_32;
-
-  offset = 0x10; // accessing port 3 (read port)
-  burstaddr = 0; // logs always start at 0
-  cs0[FPGA_MAP(FPGA_W_DDR3_P2_LADR + offset)] = ((burstaddr * 4) & 0xFFFF);
-  cs0[FPGA_MAP(FPGA_W_DDR3_P2_HADR + offset)] = ((burstaddr * 4) >> 16) & 0xFFFF;
-
-  printf( "writing log to disk" );
-  while( burstaddr < count * LOGENTRY_LEN ) {
-    arg = ((DDR3_FIFODEPTH - 1) << 4) | 1;
-    cs0[FPGA_MAP(FPGA_W_DDR3_P3_CMD)] =  arg | PULSE_GATE_MASK;
-    arg |= 0x8;
-    cs0[FPGA_MAP(FPGA_W_DDR3_P3_CMD)] =  arg | PULSE_GATE_MASK;
-    arg &= ~0x8;
-    cs0[FPGA_MAP(FPGA_W_DDR3_P3_CMD)] = arg | PULSE_GATE_MASK;
-    for( i = 0; i < DDR3_FIFODEPTH; i++ ) {
-      while( (cs0[FPGA_MAP(FPGA_R_DDR3_P3_STAT)] & 4) ) {
-	putchar('i'); fflush(stdout);// wait for queue to become full before reading
-      }
-      rv = cs0[FPGA_MAP(FPGA_R_DDR3_P3_LDAT)];
-      data = ((unsigned int) rv) & 0xFFFF;
-      rv = cs0[FPGA_MAP(FPGA_R_DDR3_P3_HDAT)];
-      data |= (rv << 16);
-      readback[i] = data;
-    }
-    while( !(cs0[FPGA_MAP(FPGA_R_DDR3_P3_STAT)] & 0x4) ) {
-      putchar('x'); fflush(stdout); // error, should be empty now
-      cs0[FPGA_MAP( FPGA_W_DDR3_P3_REN )] = 0x10;
-      cs0[FPGA_MAP( FPGA_W_DDR3_P3_REN )] = 0x00;
-    }
-    for( i = 0; i < DDR3_FIFODEPTH; i += 2 ) {
-      d = readback[i+1] & 0xFF;
-      ctrl = (readback[i+1] >> 8) & 0x1F; // control is already lined up by FPGA mapping
-      unk[0] = ((readback[i+1] >> 13) & 0xFF);
-      unk[1] = ((readback[i+1] >> 21) & 0x3);
-      // now prepare nsec, sec values:
-      // bits 31-23 are LSB of nsec
-      // 1111 1111 1_111 1111 . 1111 1111 1111 1111
-      nsec = ((readback[i] & 0x7FFFFF) << 9) | ((readback[i] >> 23) & 0x1FF);
-      sec = (readback[i] >> 23) & 0x1FF;
-      pkt_send_nand_cycle(NULL, nsec, sec, d, ctrl, unk);
-    }
-    if( (burstaddr % (1024 * 128)) == 0 ) {
-	printf( "." );
-	fflush(stdout);
-    }
-    burstaddr += DDR3_FIFODEPTH;
-    cs0[FPGA_MAP( FPGA_W_DDR3_P2_LADR + offset )] = ((burstaddr * 4) & 0xFFFF);
-    cs0[FPGA_MAP( FPGA_W_DDR3_P2_HADR + offset )] = ((burstaddr * 4) >> 16) & 0xFFFF;
-  }
-  printf( "\n" );
-}
-
 void get_time(unsigned int *s, unsigned int *ns) {
   volatile unsigned short *cs0;
 
@@ -1318,7 +1396,11 @@ void make_testdat(unsigned char *testdat) {
   int i;
   
   for( i = 0; i < TESTLEN; i++ ) {
-    testdat[i] = (i >> 3);  // 00 00 00 00 01 01 01 01 02 02 02 02 ....
+    //    testdat[i] = (i >> 3);  // 00 00 00 00 01 01 01 01 02 02 02 02 ....
+    if( i % 2 )
+      testdat[i] = 0xAA;
+    else
+      testdat[i] = 0x55;
   }
 }
 
@@ -1402,7 +1484,7 @@ void log_test() {
   log_entries |= cs0[FPGA_MAP(FPGA_R_LOG_ENTRY_H)] << 16;
   log_stat = cs0[FPGA_MAP(FPGA_R_LOG_STAT)];
 
-  printf( "log entries: %ud\n", log_entries );
+  printf( "log entries: %u\n", log_entries );
   if( log_stat & 0x1 )
     printf( "Note: data fifo overflowed\n" );
   if( log_stat & 0x2 )
@@ -1459,7 +1541,7 @@ void log_test() {
   log_entries |= cs0[FPGA_MAP(FPGA_R_LOG_ENTRY_H)] << 16;
   log_stat = cs0[FPGA_MAP(FPGA_R_LOG_STAT)];
 
-  printf( "log entries: %ud\n", log_entries );
+  printf( "log entries: %u\n", log_entries );
   if( log_stat & 0x1 )
     printf( "Note: data fifo overflowed\n" );
   if( log_stat & 0x2 )
@@ -1476,8 +1558,6 @@ void log_test() {
     printf( "Note: data fifo currently shows full\n" );
   else
     printf( "Note: data fifo currently shows not full\n" );
-
-  //  write_log(log_entries);
 
 }
 
@@ -1837,7 +1917,7 @@ void bangtest(int ofd) {
   cs0[F(FPGA_W_GPIOB_DIR)] = 0x0000; // turn off all overrides
 }
 
-void ddr3load(int ifd) {
+void ddr3load(int ifd, int verify) {
   volatile unsigned short *cs0;
   unsigned int *buf;
   unsigned int actual;
@@ -1845,6 +1925,9 @@ void ddr3load(int ifd) {
   int i;
   unsigned int arg = 0;
   int offset;
+  unsigned int rv;
+  unsigned int data;
+  unsigned int readback[DDR3_FIFODEPTH];
 
   setup_fpga();
 
@@ -1870,10 +1953,16 @@ void ddr3load(int ifd) {
   }
   actual = read(ifd, buf, 256 * 1024 * 1024);
   actual = actual / 4;
+  if( verify == 2 ) {
+    // "quick load" flag set
+    verify = 0;
+    actual = 1024 * 1024; // just load 1 meg of data
+  }
   printf( "Writing %x 32-bit words\n", actual );
   if( (actual % 64) != 0 )
     printf( "Warning: number of bytes being written is not divisible by 64\n" );
 
+  if( !verify ) {
   // dummy writes to clear any previous data in the queue -- caution, writes to "wherever"!
   while( !(cs0[FPGA_MAP(FPGA_R_DDR3_P2_STAT)] & 4) ) {
     cs0[FPGA_MAP(FPGA_W_DDR3_P2_CMD)] =  0x008 | PULSE_GATE_MASK;
@@ -1891,6 +1980,42 @@ void ddr3load(int ifd) {
   burstaddr = 0;
   cs0[FPGA_MAP(FPGA_W_DDR3_P2_LADR + offset)] = ((burstaddr * 4) & 0xFFFF);
   cs0[FPGA_MAP(FPGA_W_DDR3_P2_HADR + offset)] = ((burstaddr * 4) >> 16) & 0xFFFF;
+
+  ////////////////////  // dummy loop to clear bad config state
+  while( !(cs0[FPGA_MAP(FPGA_R_DDR3_P2_STAT)] & 4) ) {
+    putchar('-'); fflush(stdout);  // wait for write queue to be empty
+  }
+  for( i = 0; i < DDR3_FIFODEPTH; i++ ) {
+    cs0[FPGA_MAP(FPGA_W_DDR3_P2_LDAT)] = (buf[burstaddr + i] & 0xFFFF);
+    cs0[FPGA_MAP(FPGA_W_DDR3_P2_HDAT)] = (buf[burstaddr + i] >> 16) & 0xFFFF;
+  }
+  if( (cs0[FPGA_MAP(FPGA_R_DDR3_P2_STAT)] >> 8) != DDR3_FIFODEPTH ) {
+  }
+  arg = ((DDR3_FIFODEPTH - 1) << 4);
+  cs0[FPGA_MAP(FPGA_W_DDR3_P2_CMD)] =  arg | PULSE_GATE_MASK;
+  arg |= 8;
+  cs0[FPGA_MAP(FPGA_W_DDR3_P2_CMD)] =  arg | PULSE_GATE_MASK;
+  cs0[FPGA_MAP(FPGA_W_DDR3_P2_CMD)] = 0x000 | PULSE_GATE_MASK;
+  burstaddr += DDR3_FIFODEPTH;
+  cs0[FPGA_MAP(FPGA_W_DDR3_P2_LADR + offset)] = ((burstaddr * 4) & 0xFFFF);
+  cs0[FPGA_MAP(FPGA_W_DDR3_P2_HADR + offset)] = ((burstaddr * 4) >> 16) & 0xFFFF;
+
+  // dummy writes to clear any previous data in the queue -- caution, writes to "wherever"!
+  while( !(cs0[FPGA_MAP(FPGA_R_DDR3_P2_STAT)] & 4) ) {
+    cs0[FPGA_MAP(FPGA_W_DDR3_P2_CMD)] =  0x008 | PULSE_GATE_MASK;
+    cs0[FPGA_MAP(FPGA_W_DDR3_P2_CMD)] =  0x000 | PULSE_GATE_MASK;
+  }
+  // dummy reads to clear any previous data in the queue
+  while( !(cs0[FPGA_MAP(FPGA_R_DDR3_P3_STAT)] & 4) ) {
+    cs0[FPGA_MAP(FPGA_W_DDR3_P3_REN)] =  0x010;
+    cs0[FPGA_MAP(FPGA_W_DDR3_P3_REN)] =  0x000;
+  }
+
+  offset = 0;
+  burstaddr = 0;
+  cs0[FPGA_MAP(FPGA_W_DDR3_P2_LADR + offset)] = ((burstaddr * 4) & 0xFFFF);
+  cs0[FPGA_MAP(FPGA_W_DDR3_P2_HADR + offset)] = ((burstaddr * 4) >> 16) & 0xFFFF;
+  /////////////////////////// end dummy code
 
   putchar('!'); fflush(stdout);
   while( burstaddr < actual ) {
@@ -1918,8 +2043,214 @@ void ddr3load(int ifd) {
     cs0[FPGA_MAP(FPGA_W_DDR3_P2_LADR + offset)] = ((burstaddr * 4) & 0xFFFF);
     cs0[FPGA_MAP(FPGA_W_DDR3_P2_HADR + offset)] = ((burstaddr * 4) >> 16) & 0xFFFF;
   }
+  } else {
+    printf( "verifying...\n" );
+    offset = 0x10; // accessing port 3 (read port)
+    burstaddr = 0;
+    cs0[FPGA_MAP(FPGA_W_DDR3_P2_LADR + offset)] = ((burstaddr * 4) & 0xFFFF);
+    cs0[FPGA_MAP(FPGA_W_DDR3_P2_HADR + offset)] = ((burstaddr * 4) >> 16) & 0xFFFF;
+    
+    while( burstaddr < actual ) {
+      if( (burstaddr % (1024 * 1024)) == 0 ) {
+	printf( "." );
+	fflush(stdout);
+      }
+      arg = ((DDR3_FIFODEPTH - 1) << 4) | 1;
+      cs0[FPGA_MAP(FPGA_W_DDR3_P3_CMD)] =  arg | PULSE_GATE_MASK;
+      arg |= 0x8;
+      cs0[FPGA_MAP(FPGA_W_DDR3_P3_CMD)] =  arg | PULSE_GATE_MASK;
+      arg &= ~0x8;
+      cs0[FPGA_MAP(FPGA_W_DDR3_P3_CMD)] = arg | PULSE_GATE_MASK;
+      for( i = 0; i < DDR3_FIFODEPTH; i++ ) {
+	while( (cs0[FPGA_MAP(FPGA_R_DDR3_P3_STAT)] & 4) ) {
+	  putchar('i'); fflush(stdout);// wait for queue to become full before reading
+	}
+	rv = cs0[FPGA_MAP(FPGA_R_DDR3_P3_LDAT)];
+	data = ((unsigned int) rv) & 0xFFFF;
+	rv = cs0[FPGA_MAP(FPGA_R_DDR3_P3_HDAT)];
+	data |= (rv << 16);
+	readback[i] = data;
+      }
+      while( !(cs0[FPGA_MAP(FPGA_R_DDR3_P3_STAT)] & 0x4) ) {
+	putchar('x'); fflush(stdout); // error, should be empty now
+	cs0[FPGA_MAP( FPGA_W_DDR3_P3_REN )] = 0x10;
+	cs0[FPGA_MAP( FPGA_W_DDR3_P3_REN )] = 0x00;
+      }
+      for( i = 0; i < DDR3_FIFODEPTH; i++ ) {
+	if(buf[burstaddr + i] != readback[i]) {
+	  printf( "\n%08x: ", (burstaddr + i) * 4);
+	  printf( "+%08x -%08x", buf[burstaddr + i], readback[i] );
+	}
+      }
+      burstaddr += DDR3_FIFODEPTH;
+      cs0[FPGA_MAP( FPGA_W_DDR3_P2_LADR + offset )] = ((burstaddr * 4) & 0xFFFF);
+      cs0[FPGA_MAP( FPGA_W_DDR3_P2_HADR + offset )] = ((burstaddr * 4) >> 16) & 0xFFFF;
+    }
+
+  }
   printf( "\n" );
 
+}
+
+void sdwrite(unsigned int sector) {
+  struct sd_state *state;
+  unsigned char testdat[TESTLEN];
+  int ifd;
+
+  ifd = open("/dev/null", O_CREAT | O_WRONLY | O_TRUNC, 0644 );
+
+  init_packet_log(ifd);
+
+  state = (struct sd_state *) sd_init(MISO_PIN, MOSI_PIN, CLK_PIN, CS_PIN, POWER_PIN);
+  if (!state)
+    return;
+
+  printf( "writing data\n" );
+  make_testdat(testdat);
+
+  sd_write_block (state, sector,		/* Start sector number (LBA) */
+		  testdat,	/* Pointer to the data to be written */
+		  //		  TESTLEN / 512			/* Sector count (1..128) */
+		  1
+		  );
+}
+
+void sdread(unsigned int sector) {
+  struct sd_state *state;
+  unsigned char testdat[TESTLEN];
+  int ifd;
+
+  ifd = open("/dev/null", O_CREAT | O_WRONLY | O_TRUNC, 0644 );
+
+  init_packet_log(ifd);
+
+  state = (struct sd_state *) sd_init(MISO_PIN, MOSI_PIN, CLK_PIN, CS_PIN, POWER_PIN);
+  if (!state)
+    return;
+
+  printf( "reading data\n" );
+  sd_read_block (
+		 state, 10000,	/* Start sector number (LBA) */
+		 testdat,		/* Pointer to the data buffer to store read data */
+		 1		/* Sector count (1..128) */
+		 );
+
+  printf( "Read back sector dump:\n" );
+  print_sector(testdat);
+}
+
+void sd_test1(unsigned int sector, int ifd) {
+  struct sd_state *state;
+  unsigned char testdat[TESTLEN];
+  unsigned int s;
+  unsigned int ns;
+  double timeval;
+  unsigned int log_entries;
+  unsigned short log_stat;
+  volatile unsigned short *cs0;
+
+  if(mem_32)
+    munmap(mem_32, 0xFFFF);
+  if(fd)
+    close(fd);
+
+  fd = open("/dev/mem", O_RDWR);
+  if( fd < 0 ) {
+    perror("Unable to open /dev/mem");
+    fd = 0;
+    return;
+  }
+
+  mem_32 = mmap(0, 0xffff, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0x08040000);
+  cs0 = (volatile unsigned short *)mem_32;
+
+
+  init_packet_log(ifd);
+
+  state = (struct sd_state *) sd_init(MISO_PIN, MOSI_PIN, CLK_PIN, CS_PIN, POWER_PIN);
+  if (!state)
+    return;
+#if 1
+
+  cs0[FPGA_MAP(FPGA_W_LOG_CMD)] =  0x1;  // reset the log
+  cs0[FPGA_MAP(FPGA_W_LOG_CMD)] = 0x0;
+  usleep(10000);
+
+  printf( "writing data\n" );
+  make_testdat(testdat);
+  // write some data in
+  printf( "log run state: %d\n",  cs0[FPGA_MAP(FPGA_W_LOG_CMD)] );
+  cs0[FPGA_MAP(FPGA_W_LOG_CMD)] = 0x2; // run the log
+  printf( "log run state: %d\n",  cs0[FPGA_MAP(FPGA_W_LOG_CMD)] );
+
+  sd_write_block (state, sector,		/* Start sector number (LBA) */
+		  testdat,	/* Pointer to the data to be written */
+		  //		  TESTLEN / 512			/* Sector count (1..128) */
+		  1
+		  );
+#endif
+  sleep(1);
+  printf( "log run state: %d\n",  cs0[FPGA_MAP(FPGA_W_LOG_CMD)] );
+  cs0[FPGA_MAP(FPGA_W_LOG_CMD)] = 0x0; // stop the log
+  printf( "log run state: %d\n",  cs0[FPGA_MAP(FPGA_W_LOG_CMD)] );
+
+  printf( "reading data\n" );
+  sd_read_block (
+		 state, sector,	/* Start sector number (LBA) */
+		 testdat,		/* Pointer to the data buffer to store read data */
+		 1		/* Sector count (1..128) */
+		 );
+
+  printf( "Read back sector dump:\n" );
+  print_sector(testdat);
+
+#if 0
+  sd_reset(state, 2);
+
+  printf( "reading data\n" );
+  sd_read_block (
+		 state, sector,	/* Start sector number (LBA) */
+		 testdat,		/* Pointer to the data buffer to store read data */
+		 1		/* Sector count (1..128) */
+		 );
+
+  printf( "Read back sector dump:\n" );
+  print_sector(testdat);
+#endif
+
+  ns = cs0[FPGA_MAP(FPGA_R_LOG_TIME_NSL)] & 0xFFFF;
+  ns |= cs0[FPGA_MAP(FPGA_R_LOG_TIME_NSH)] << 16;
+  s = cs0[FPGA_MAP(FPGA_R_LOG_TIME_SL)] & 0xFFFF;
+  s |= cs0[FPGA_MAP(FPGA_R_LOG_TIME_SH)] << 16;
+
+  timeval = (double) s;
+  timeval = timeval + ((double) ns / 1000000000);
+
+  printf( "time according to the FPGA: %lf seconds\n", timeval );
+
+  log_entries = cs0[FPGA_MAP(FPGA_R_LOG_ENTRY_L)] & 0xFFFF;
+  log_entries |= cs0[FPGA_MAP(FPGA_R_LOG_ENTRY_H)] << 16;
+  log_stat = cs0[FPGA_MAP(FPGA_R_LOG_STAT)];
+
+  printf( "log entries: %u\n", log_entries );
+  if( log_stat & 0x1 )
+    printf( "Note: data fifo overflowed\n" );
+  if( log_stat & 0x2 )
+    printf( "Note: command fifo overflowed\n" );
+  if( log_stat & 0x4 )
+    printf( "Note: extended command fifo underflowed\n" );
+  if( log_stat & 0x8 )
+    printf( "Note: extended command fifo overflowed\n" );
+  printf( "Max command fifo depth: %d\n", (log_stat >> 4) & 0x1F );
+  printf( "Max data fifo depth: %d\n", (log_stat >> 9) & 0x7F );
+
+  log_stat = cs0[FPGA_MAP(FPGA_R_LOG_DEBUG)];
+  if( log_stat & 0x1 )
+    printf( "Note: data fifo currently shows full\n" );
+  else
+    printf( "Note: data fifo currently shows not full\n" );
+  
+  log_dump(ifd, log_entries, 1);
 }
 
 void romreset() {
@@ -2137,7 +2468,7 @@ int main(int argc, char **argv) {
       }
       argc--;
       argv++;
-      log_dump(infile, a1);
+      log_dump(infile, a1, 0);
       close(infile);
     }
     else if(!strcmp(*argv, "-ddr3dump")) { // dump DDR3 to screen
@@ -2171,7 +2502,7 @@ int main(int argc, char **argv) {
       argv++;
       bangtest(infile);
     }
-    else if(!strcmp(*argv, "-ddr3load")) { // dump DDR3 to screen
+    else if(!strcmp(*argv, "-ddr3load")) { // load DDR3 with values from file (for romulation)
       argc--;
       argv++;
       if( argc != 1 ) {
@@ -2185,11 +2516,84 @@ int main(int argc, char **argv) {
       }
       argc--;
       argv++;
-      ddr3load(infile);
+      ddr3load(infile, 0);
+    } else if(!strcmp(*argv, "-ddr3qload")) { // load DDR3 with values from file (just first 64k)
+      argc--;
+      argv++;
+      if( argc != 1 ) {
+	printf( "usage -ddr3qload <file>\n" );
+	return 1;
+      }
+      infile = open(*argv, O_RDONLY );
+      if( infile == -1 ) {
+	printf("Unable to open %s\n", *argv );
+	return 1;
+      }
+      argc--;
+      argv++;
+      ddr3load(infile, 2);
+    } else if(!strcmp(*argv, "-ddr3verify")) { // verify romulator image integrity
+      argc--;
+      argv++;
+      if( argc != 1 ) {
+	printf( "usage -ddr3verify <file>\n" );
+	return 1;
+      }
+      infile = open(*argv, O_RDONLY );
+      if( infile == -1 ) {
+	printf("Unable to open %s\n", *argv );
+	return 1;
+      }
+      argc--;
+      argv++;
+      ddr3load(infile, 1);
     } else if(!strcmp(*argv, "-romreset")) {
       argc--;
       argv++;
       romreset(infile);
+    }
+    else if(!strcmp(*argv, "-sdtest1")) {  // test write/read of SD data to card (romulator verification)
+      argc--;
+      argv++;
+      if( argc != 2 ) {
+	printf( "usage -sdtest1 <sector> <logfile.bin>\n" );
+	return 1;
+      }
+      a1 = strtoul(*argv, NULL, 16);
+      argc--;
+      argv++;
+      infile = open(*argv, O_CREAT | O_WRONLY | O_TRUNC, 0644 );
+      if( infile == -1 ) {
+	printf("Unable to open %s\n", *argv );
+	return 1;
+      }
+      argc--;
+      argv++;
+      sd_test1(a1, infile);
+    }
+    else if(!strcmp(*argv, "-sdwrite")) {  // write fixed test data to sector
+      argc--;
+      argv++;
+      if( argc != 1 ) {
+	printf( "usage -sdwrite <sector>\n" );
+	return 1;
+      }
+      a1 = strtoul(*argv, NULL, 16);
+      argc--;
+      argv++;
+      sdwrite(a1);
+    }
+    else if(!strcmp(*argv, "-sdread")) {  // dump a sector
+      argc--;
+      argv++;
+      if( argc != 1 ) {
+	printf( "usage -sdread <sector>\n" );
+	return 1;
+      }
+      a1 = strtoul(*argv, NULL, 16);
+      argc--;
+      argv++;
+      sdread(a1);
     }
     else {
       print_usage(prog);
