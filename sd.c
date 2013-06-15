@@ -136,7 +136,7 @@ static int init_port(struct sd_state *state) {
 	*eim_get(fpga_w_nand_power) = 0;
 	usleep(100000);
 	CS_H();
-	usleep(300000);
+	usleep(500000);
 
 	gpio_set_value(GPIO_IS_EIM|1, rand()&1);
 	gpio_set_value(GPIO_IS_EIM|2, rand()&1);

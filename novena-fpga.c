@@ -1394,7 +1394,7 @@ void get_time(unsigned int *s, unsigned int *ns) {
 #define TESTLEN 4096
 void make_testdat(unsigned char *testdat) {
   int i;
-  
+#if 1  
   for( i = 0; i < TESTLEN; i++ ) {
     //    testdat[i] = (i >> 3);  // 00 00 00 00 01 01 01 01 02 02 02 02 ....
     if( i % 2 )
@@ -1402,6 +1402,12 @@ void make_testdat(unsigned char *testdat) {
     else
       testdat[i] = 0x55;
   }
+#else
+  for( i = 0; i < TESTLEN; i++ ) {
+    testdat[i] = 0xDD;
+  }
+#endif
+
 }
 
 void print_sector(unsigned char *testdat) {
@@ -1956,7 +1962,7 @@ void ddr3load(int ifd, int verify) {
   if( verify == 2 ) {
     // "quick load" flag set
     verify = 0;
-    actual = 1024 * 1024; // just load 1 meg of data
+    actual = 1024 * 1024 * 2; // just load 2 meg of data
   }
   printf( "Writing %x 32-bit words\n", actual );
   if( (actual % 64) != 0 )
@@ -2115,10 +2121,15 @@ void sdwrite(unsigned int sector) {
 		  );
 }
 
-void sdread(unsigned int sector) {
+void sdread(unsigned int sector, int do_reset) {
   struct sd_state *state;
   unsigned char testdat[TESTLEN];
   int ifd;
+  int i;
+
+  for( i = 0; i < TESTLEN; i++ ) {
+    testdat[i] = 0;
+  }
 
   ifd = open("/dev/null", O_CREAT | O_WRONLY | O_TRUNC, 0644 );
 
@@ -2128,9 +2139,15 @@ void sdread(unsigned int sector) {
   if (!state)
     return;
 
+  if( do_reset ) {
+    sd_reset(state, 2);
+    printf("CID:\n");
+    send_cmdX(state, 10, 0, 0, 0, 0, 32);
+    printf("\n");
+  }
   printf( "reading data\n" );
   sd_read_block (
-		 state, 10000,	/* Start sector number (LBA) */
+		 state, sector,	/* Start sector number (LBA) */
 		 testdat,		/* Pointer to the data buffer to store read data */
 		 1		/* Sector count (1..128) */
 		 );
@@ -2138,6 +2155,7 @@ void sdread(unsigned int sector) {
   printf( "Read back sector dump:\n" );
   print_sector(testdat);
 }
+
 
 void sd_test1(unsigned int sector, int ifd) {
   struct sd_state *state;
@@ -2593,7 +2611,19 @@ int main(int argc, char **argv) {
       a1 = strtoul(*argv, NULL, 16);
       argc--;
       argv++;
-      sdread(a1);
+      sdread(a1, 1);
+    }
+    else if(!strcmp(*argv, "-sdread_nores")) {  // dump a sector
+      argc--;
+      argv++;
+      if( argc != 1 ) {
+	printf( "usage -sdread_nores <sector>\n" );
+	return 1;
+      }
+      a1 = strtoul(*argv, NULL, 16);
+      argc--;
+      argv++;
+      sdread(a1, 0);
     }
     else {
       print_usage(prog);
