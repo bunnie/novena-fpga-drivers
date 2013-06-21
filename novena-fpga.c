@@ -1,7 +1,11 @@
+//#define _GNU_SOURCE // for O_DIRECT
+
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+//#include <sys/types.h>
+//#include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
@@ -276,9 +280,9 @@ void print_usage(char *progname) {
 }
 
 
-static inline int swab(int arg) {
-  return ((arg&0xff)<<24) | ((arg&0xff00)<<8) | ((arg&0xff0000)>>8) | ((arg&0xff000000)>>24);
-}
+//static inline int swab(int arg) {
+//  return ((arg&0xff)<<24) | ((arg&0xff00)<<8) | ((arg&0xff0000)>>8) | ((arg&0xff000000)>>24);
+//}
 
 void setup_fpga() {
   int i;
@@ -434,7 +438,7 @@ void setup_fpga_cs1() {
   write_kernel_memory( 0x20e0400, 0xb0f1, 0, 4 ); // A18
 
   // EIM_CS1GCR1   
-  // 0011 0  001 1   001    0   001 00  00  1  100  1    0   0   0   1   1   1   1
+  // 0011 0  001 1   001    0   001 00  10  1  100  1    0   1   1   1   1   1   1
   // PSZ  WP GBC AUS CSREC  SP  DSZ BCS BCD WC BL   CREP CRE RFL WFL MUM SRD SWR CSEN
   //
   // PSZ = 0011  64 words page size
@@ -445,16 +449,16 @@ void setup_fpga_cs1() {
   // SP = 0      no supervisor protect (user mode access allowed)
   // DSZ = 001   16-bit port resides on DATA[15:0]
   // BCS = 00    0 clock delay for burst generation
-  // BCD = 00    divide EIM clock by 1 for burst clock
+  // BCD = 00    divide EIM clock by 0 for burst clock
   // WC = 1      write accesses are continuous burst length
   // BL = 100    continuous burst length
   // CREP = 1    non-PSRAM, set to 1
   // CRE = 0     CRE is disabled
-  // RFL = 0     variable latency reads
-  // WFL = 0     variable latency writes
+  // RFL = 1     fixed latency reads
+  // WFL = 1     fixed latency writes
   // MUM = 1     multiplexed mode enabled
-  // SRD = 1     no synch reads
-  // SWR = 1     no synch writes
+  // SRD = 1     synch reads
+  // SWR = 1     synch writes
   // CSEN = 1    chip select is enabled
 
   // 0101 0111 1111    0001 1100  0000  1011   1   0   0   1
@@ -463,26 +467,29 @@ void setup_fpga_cs1() {
   // 0101 0001 1001    0001 1100  0000  1011   1001
   // 5     1    9       1    c     0     B      9
 
-  write_kernel_memory( 0x21b8000, 0x5191C0B9, 0, 4 );
+  // 0011 0001 1001    0001 0000  1100  1011   1111
 
-  // EIM_CS0GCR2   
+  write_kernel_memory( 0x21b8000 + 0x18, 0x31910CBF, 0, 4 );
+
+  // EIM_CS1GCR2   
   //  MUX16_BYP_GRANT = 1
-  //  ADH = 1 (1 cycles)
-  //  0x1001
-  write_kernel_memory( 0x21b8004, 0x1001, 0, 4 );
+  //  ADH = 0 (0 cycles)
+  //  0x1000
+  write_kernel_memory( 0x21b8004 + 0x18, 0x1000, 0, 4 );
 
 
-  // EIM_CS0RCR1   
-  // 00 000101 0 000   0   000   0 000 0 000 0 000 0 000
+  // EIM_CS1RCR1   
+  // 00 000100 0 000   0   001   0 010 0 000 0 000 0 000
   //    RWSC     RADVA RAL RADVN   OEA   OEN   RCSA  RCSN
-  // RWSC 000101    5 cycles for reads to happen
   //
   // 0000 0111 0000   0011   0000 0000 0000 0000
   //  0    7     0     3      0  0    0    0
   // 0000 0101 0000   0000   0 000 0 000 0 000 0 000
 //  write_kernel_memory( 0x21b8008, 0x05000000, 0, 4 );
-  write_kernel_memory( 0x21b8008, 0x0A024000, 0, 4 );
-  // EIM_CS0RCR2  
+  // 0000 0011 0000   0001   0001 0000 0000 0000
+  write_kernel_memory( 0x21b8008 + 0x18, 0x04011000, 0, 4 );
+
+  // EIM_CS1RCR2  
   // 0000 0000 0   000 00 00 0 010  0 001 
   //           APR PAT    RL   RBEA   RBEN
   // APR = 0   mandatory because MUM = 1
@@ -491,10 +498,10 @@ void setup_fpga_cs1() {
   // RBEA = 000  these match RCSA/RCSN from previous field
   // RBEN = 000
   // 0000 0000 0000 0000 0000  0000
-  write_kernel_memory( 0x21b800c, 0x00000000, 0, 4 );
+  write_kernel_memory( 0x21b800c + 0x18, 0x00000000, 0, 4 );
 
-  // EIM_CS0WCR1
-  // 0   0    000100 000   000   000  000  010 000 000  000
+  // EIM_CS1WCR1
+  // 0   0    000010 000   001   000  000  010 000 000  000
   // WAL WBED WWSC   WADVA WADVN WBEA WBEN WEA WEN WCSA WCSN
   // WAL = 0       use WADVN
   // WBED = 0      allow BE during write
@@ -514,16 +521,25 @@ void setup_fpga_cs1() {
   // 0000 0100 0000 0000 0000  0100 0000 0000
   //  0    4    0    0     0    4     0    0
 
-  write_kernel_memory( 0x21b8010, 0x09080800, 0, 4 );
+  // 0000 0010 0000 0000 0000  0010 0000 0000
+  // 0000 0010 0000 0100 0000  0100 0000 0000
+
+  write_kernel_memory( 0x21b8010 + 0x18, 0x02040400, 0, 4 );
 
   // EIM_WCR
   // BCM = 1   free-run BCLK
-  // GBCD = 0  don't divide the burst clock
-  write_kernel_memory( 0x21b8090, 0x1, 0, 4 );
+  // GBCD = 0  divide the burst clock by 1
+  // add timeout watchdog after 1024 bclk cycles
+  write_kernel_memory( 0x21b8090, 0x701, 0, 4 );
 
   // EIM_WIAR 
   // ACLK_EN = 1
   write_kernel_memory( 0x21b8094, 0x10, 0, 4 );
+
+  printf( "resetting CS0 space to 64M and enabling 64M CS1 space.\n" );
+  write_kernel_memory( 0x20e0004, 
+		       (read_kernel_memory(0x20e0004, 0, 4) & 0xFFFFFFC0) |
+		       0x1B, 0, 4);
 
   printf( "done.\n" );
 }
@@ -1549,7 +1565,7 @@ void log_test() {
   unsigned char testdat[TESTLEN];
 
   setup_fpga();
-  setup_fpga_cs1();
+  //  setup_fpga_cs1();
 
   if(mem_32)
     munmap(mem_32, 0xFFFF);
@@ -1890,7 +1906,7 @@ void bangtest(int ofd) {
   memset(data, 0, MAXDEPTH); // clear the data array to start with
 
   setup_fpga();
-  setup_fpga_cs1();
+  //  setup_fpga_cs1();
 
   if(mem_32)
     munmap(mem_32, 0xFFFF);
@@ -2056,7 +2072,7 @@ void ddr3load(int ifd, int verify) {
   unsigned int readback[DDR3_FIFODEPTH];
 
   setup_fpga();
-  setup_fpga_cs1();
+  //  setup_fpga_cs1();
 
   if(mem_32)
     munmap(mem_32, 0xFFFF);
@@ -2415,6 +2431,56 @@ void romreset() {
   cs0[F(FPGA_W_NAND_UK_CTL)] = 0x0000;
 }
 
+int testcs1() {
+  unsigned long long i;
+  unsigned long long retval;
+  volatile unsigned long long *cs1;
+  unsigned long long testbuf[16];
+
+  setup_fpga_cs1();
+
+  if(mem_32)
+    munmap(mem_32, 0xFFFF);
+  if(fd)
+    close(fd);
+
+  fd = open("/dev/mem", O_RDWR);
+  if( fd < 0 ) {
+    perror("Unable to open /dev/mem");
+    fd = 0;
+    return 0;
+  }
+
+  mem_32 = mmap(0, 0xffff, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0x0C000000);
+  cs1 = (unsigned int *)mem_32;
+
+  for( i = 0; i < 16; i++ ) {
+    testbuf[i] = i | (i + 64) << 16 | (i + 8) << 32 | (i + 16) << 48 ;
+  }
+
+  retval = 0;
+
+  memcpy(cs1, testbuf, 16*8);
+
+  memcpy(testbuf, cs1, 16*8);
+
+  cs1[0] = 0xdeadbeeffeedfaceLL;
+  cs1[1] = 0x12456789abcdef01LL;
+  cs1[2] = 0xf0f0f0f0f0f0f0f0LL;
+  cs1[3] = 0x12345555aaaa9876LL;
+
+  retval = cs1[0];
+  retval = cs1[1];
+  retval = cs1[2];
+  retval = cs1[3];
+  retval = cs1[4];
+  retval = cs1[5];
+
+  //  for( i = 0; i < 32; i++ ) {
+  //  }
+  return retval;
+}
+
 int main(int argc, char **argv) {
   unsigned int a1, a2;
   int infile;
@@ -2438,7 +2504,7 @@ int main(int argc, char **argv) {
       argc--;
       argv++;
       setup_fpga();
-      setup_fpga_cs1();
+      //      setup_fpga_cs1();
     }
     else if(!strcmp(*argv, "-t")) {
       argc--;
@@ -2746,6 +2812,11 @@ int main(int argc, char **argv) {
       argc--;
       argv++;
       sdread(a1, 0);
+    }
+    else if(!strcmp(*argv, "-testcs1")) {
+      argc--;
+      argv++;
+      testcs1();
     }
     else {
       print_usage(prog);
