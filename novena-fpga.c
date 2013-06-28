@@ -412,8 +412,8 @@ void setup_fpga() {
   // 0000 0100 0000 0000 0000  0100 0000 0000
   //  0    4    0    0     0    4     0    0
 
-  //  write_kernel_memory( 0x21b8010, 0x09080800, 0, 4 );
-  write_kernel_memory( 0x21b8010, 0x02040400, 0, 4 );
+  write_kernel_memory( 0x21b8010, 0x09080800, 0, 4 );
+  //  write_kernel_memory( 0x21b8010, 0x02040400, 0, 4 );
 
   // EIM_WCR
   // BCM = 1   free-run BCLK
