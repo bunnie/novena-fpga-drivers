@@ -42,9 +42,11 @@ static char  *mem_8  = 0;
 static int *prev_mem_range = 0;
 
 #define FPGA_REG_OFFSET    0x08040000
+#define FPGA_CS1_REG_OFFSET    0x0C040000
 
 #define FPGA_MAP(x)         ( (x - FPGA_REG_OFFSET) >> 1 )
 #define F(x)                ( (x - FPGA_REG_OFFSET) >> 1 )
+#define F1(x)                ( (x - FPGA_CS1_REG_OFFSET) >> 3 )
 
 #define FPGA_W_TEST0       0x08040000
 #define FPGA_W_TEST1       0x08040002
@@ -108,6 +110,20 @@ static int *prev_mem_range = 0;
 
 #define FPGA_R_DDR3_V_MINOR 0x08041FFC
 #define FPGA_R_DDR3_V_MAJOR 0x08041FFE
+
+// burst access registers (in CS1 bank -- only 64-bit access allowed)
+#define FPGA_WB_LOOP0       0x0C040000
+#define FPGA_WB_LOOP1       0x0C040008
+
+#define FPGA_WB_DDR3_RD_CTL 0x0C040100
+
+#define FPGA_RB_LOOP0       0x0C041000
+#define FPGA_RB_LOOP1       0x0C041008
+
+#define FPGA_RB_DDR3_RD_DATA 0x0C041100
+#define FPGA_RB_DDR3_RD_STAT 0x0C041108
+
+
 
 #define B_WE  ((unsigned short) 0x100)
 #define B_RE  ((unsigned short) 0x200)
@@ -319,43 +335,38 @@ void setup_fpga() {
 
   write_kernel_memory( 0x020c4080, 0xcf3, 0, 4 ); // ungate eim slow clocks
 
-  // EIM_CS0GCR1   
-  // 0101 0  001 1   001    0   001 11  00  0  000  1    0   1   1   1   0   0   1
+  // rework timing for sync use
+  // 0011 0  001 1   001    0   001 00  00  1  011  1    0   1   1   1   1   1   1
   // PSZ  WP GBC AUS CSREC  SP  DSZ BCS BCD WC BL   CREP CRE RFL WFL MUM SRD SWR CSEN
   //
-  // PSZ = 0101  256 words page size
+  // PSZ = 0011  64 words page size
   // WP = 0      (not protected)
   // GBC = 001   min 1 cycles between chip select changes
   // AUS = 0     address shifted according to port size
   // CSREC = 001 min 1 cycles between CS, OE, WE signals
   // SP = 0      no supervisor protect (user mode access allowed)
   // DSZ = 001   16-bit port resides on DATA[15:0]
-  // BCS = 11    3 clock delay for burst generation
-  // BCD = 00    divide EIM clock by 1 for burst clock
-  // WC = 0      specify write bust according to BL
-  // BL = 000    4 words wrap burst length
+  // BCS = 00    0 clock delay for burst generation
+  // BCD = 00    divide EIM clock by 0 for burst clock
+  // WC = 1      write accesses are continuous burst length
+  // BL = 011    32 word memory wrap length
   // CREP = 1    non-PSRAM, set to 1
   // CRE = 0     CRE is disabled
-  // RFL = 1     fixed latency reads (don't monitor WAIT)
-  // WFL = 1     fixed latency writes (don't monitor WAIT)
+  // RFL = 1     fixed latency reads
+  // WFL = 1     fixed latency writes
   // MUM = 1     multiplexed mode enabled
-  // SRD = 0     no synch reads
-  // SWR = 0     no synch writes
+  // SRD = 1     synch reads
+  // SWR = 1     synch writes
   // CSEN = 1    chip select is enabled
 
-  // 0101 0111 1111    0001 1100  0000  1011   1   0   0   1
-  // 0x5  7    F        1   C     0     B    9
-
-  // 0101 0001 1001    0001 1100  0000  1011   1001
-  // 5     1    9       1    c     0     B      9
-
-  write_kernel_memory( 0x21b8000, 0x5191C0B9, 0, 4 );
+  //  write_kernel_memory( 0x21b8000, 0x5191C0B9, 0, 4 );
+  write_kernel_memory( 0x21b8000, 0x31910BBF, 0, 4 );
 
   // EIM_CS0GCR2   
   //  MUX16_BYP_GRANT = 1
   //  ADH = 1 (1 cycles)
   //  0x1001
-  write_kernel_memory( 0x21b8004, 0x1001, 0, 4 );
+  write_kernel_memory( 0x21b8004, 0x1000, 0, 4 );
 
 
   // EIM_CS0RCR1   
@@ -367,7 +378,8 @@ void setup_fpga() {
   //  0    7     0     3      0  0    0    0
   // 0000 0101 0000   0000   0 000 0 000 0 000 0 000
 //  write_kernel_memory( 0x21b8008, 0x05000000, 0, 4 );
-  write_kernel_memory( 0x21b8008, 0x0A024000, 0, 4 );
+//  write_kernel_memory( 0x21b8008, 0x0A024000, 0, 4 );
+  write_kernel_memory( 0x21b8008, 0x09014000, 0, 4 );
   // EIM_CS0RCR2  
   // 0000 0000 0   000 00 00 0 010  0 001 
   //           APR PAT    RL   RBEA   RBEN
@@ -400,12 +412,13 @@ void setup_fpga() {
   // 0000 0100 0000 0000 0000  0100 0000 0000
   //  0    4    0    0     0    4     0    0
 
-  write_kernel_memory( 0x21b8010, 0x09080800, 0, 4 );
+  //  write_kernel_memory( 0x21b8010, 0x09080800, 0, 4 );
+  write_kernel_memory( 0x21b8010, 0x02040400, 0, 4 );
 
   // EIM_WCR
   // BCM = 1   free-run BCLK
   // GBCD = 0  don't divide the burst clock
-  write_kernel_memory( 0x21b8090, 0x1, 0, 4 );
+  write_kernel_memory( 0x21b8090, 0x701, 0, 4 );
 
   // EIM_WIAR 
   // ACLK_EN = 1
@@ -438,7 +451,7 @@ void setup_fpga_cs1() {
   write_kernel_memory( 0x20e0400, 0xb0f1, 0, 4 ); // A18
 
   // EIM_CS1GCR1   
-  // 0011 0  001 1   001    0   001 00  10  1  100  1    0   1   1   1   1   1   1
+  // 0011 0  001 1   001    0   001 00  00  1  011  1    0   1   1   1   1   1   1
   // PSZ  WP GBC AUS CSREC  SP  DSZ BCS BCD WC BL   CREP CRE RFL WFL MUM SRD SWR CSEN
   //
   // PSZ = 0011  64 words page size
@@ -451,7 +464,7 @@ void setup_fpga_cs1() {
   // BCS = 00    0 clock delay for burst generation
   // BCD = 00    divide EIM clock by 0 for burst clock
   // WC = 1      write accesses are continuous burst length
-  // BL = 100    continuous burst length
+  // BL = 011    32 word memory wrap length
   // CREP = 1    non-PSRAM, set to 1
   // CRE = 0     CRE is disabled
   // RFL = 1     fixed latency reads
@@ -467,9 +480,9 @@ void setup_fpga_cs1() {
   // 0101 0001 1001    0001 1100  0000  1011   1001
   // 5     1    9       1    c     0     B      9
 
-  // 0011 0001 1001    0001 0000  1100  1011   1111
+  // 0011 0001 1001    0001 0000  1011  1011   1111
 
-  write_kernel_memory( 0x21b8000 + 0x18, 0x31910CBF, 0, 4 );
+  write_kernel_memory( 0x21b8000 + 0x18, 0x31910BBF, 0, 4 );
 
   // EIM_CS1GCR2   
   //  MUX16_BYP_GRANT = 1
@@ -478,8 +491,15 @@ void setup_fpga_cs1() {
   write_kernel_memory( 0x21b8004 + 0x18, 0x1000, 0, 4 );
 
 
+  // 9 cycles is total length of read
+  // 2 cycles for address
+  // +4 more cycles for first data to show up
+
   // EIM_CS1RCR1   
   // 00 000100 0 000   0   001   0 010 0 000 0 000 0 000
+  //    RWSC     RADVA RAL RADVN   OEA   OEN   RCSA  RCSN
+  //
+  // 00 001001 0 000   0   001   0 110 0 000 0 000 0 000
   //    RWSC     RADVA RAL RADVN   OEA   OEN   RCSA  RCSN
   //
   // 0000 0111 0000   0011   0000 0000 0000 0000
@@ -487,7 +507,10 @@ void setup_fpga_cs1() {
   // 0000 0101 0000   0000   0 000 0 000 0 000 0 000
 //  write_kernel_memory( 0x21b8008, 0x05000000, 0, 4 );
   // 0000 0011 0000   0001   0001 0000 0000 0000
-  write_kernel_memory( 0x21b8008 + 0x18, 0x04011000, 0, 4 );
+
+  // 0000 1001 0000   0001   0110 0000 0000 0000
+  // 
+  write_kernel_memory( 0x21b8008 + 0x18, 0x09014000, 0, 4 );
 
   // EIM_CS1RCR2  
   // 0000 0000 0   000 00 00 0 010  0 001 
@@ -498,7 +521,7 @@ void setup_fpga_cs1() {
   // RBEA = 000  these match RCSA/RCSN from previous field
   // RBEN = 000
   // 0000 0000 0000 0000 0000  0000
-  write_kernel_memory( 0x21b800c + 0x18, 0x00000000, 0, 4 );
+  write_kernel_memory( 0x21b800c + 0x18, 0x00000200, 0, 4 );
 
   // EIM_CS1WCR1
   // 0   0    000010 000   001   000  000  010 000 000  000
@@ -1352,6 +1375,8 @@ void dump_ddr3(unsigned int address, unsigned int len) {
   mem_32 = mmap(0, 0xffff, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0x08040000);
   cs0 = (volatile unsigned short *)mem_32;
 
+  cs0[F(FPGA_W_DDR3_P3_CMD)] &= 0x7FFF;  // clear burst mode
+
   offset = 0x10; // accessing port 3 (read port)
   burstaddr = address / 4;
   cs0[FPGA_MAP(FPGA_W_DDR3_P2_LADR + offset)] = ((burstaddr * 4) & 0xFFFF);
@@ -1391,6 +1416,216 @@ void dump_ddr3(unsigned int address, unsigned int len) {
   printf( "\n" );
 
 }
+
+#define DDR3_BCOUNT 16LL
+void dump_ddr3_burst(unsigned int address, unsigned int len) {
+  unsigned long long readback[DDR3_BCOUNT];
+  int i;
+  int burstaddr = 0;
+  unsigned long long data;
+  volatile unsigned long long *cs1;
+  volatile unsigned short *cs0;
+
+  setup_fpga_cs1();
+
+  if(mem_32)
+    munmap(mem_32, 0xFFFF);
+  if(fd)
+    close(fd);
+
+  fd = open("/dev/mem", O_RDWR);
+  if( fd < 0 ) {
+    perror("Unable to open /dev/mem");
+    fd = 0;
+    return;
+  }
+
+  mem_32 = mmap(0, 0xffff, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0x08040000);
+  cs0 = (volatile unsigned short *)mem_32;
+  cs0[F(FPGA_W_DDR3_P3_CMD)] = 0x8000;  // set burst mode for ddr3 access
+
+  if(mem_32)
+    munmap(mem_32, 0xFFFF);
+  if(fd)
+    close(fd);
+
+  fd = open("/dev/mem", O_RDWR);
+  if( fd < 0 ) {
+    perror("Unable to open /dev/mem");
+    fd = 0;
+    return;
+  }
+
+  mem_32 = mmap(0, 0xffff, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0x0C040000);
+  cs1 = (volatile unsigned long long *)mem_32;
+
+  cs1[F1(FPGA_WB_DDR3_RD_CTL)] = 0x8000000000000000LL; // reset the interface
+  cs1[F1(FPGA_WB_DDR3_RD_CTL)] = 0x0000000000000000LL;
+
+  usleep(1000);
+
+  printf( "flags: " );
+  //  data = cs1[F1(FPGA_RB_DDR3_RD_STAT)];
+  memcpy(&(data),(void *) &(cs1[F1(FPGA_RB_DDR3_RD_STAT)]), 8);
+
+  if( data & 0x1000 ) 
+    printf( "cmd_err " );
+  if( data & 0x0800 )
+    printf( "cmd_empty " );
+  if( data & 0x0400 )
+    printf( "cmd_full " );
+  if( data & 0x0200 )
+    printf( "data_empty " );
+  if( data & 0x0100 )
+    printf( "data_full " );
+  printf( "fifocount: %d, readcount: %d\n", (int) data & 0x7F, (int) (data >> 16) & 0xFF );
+
+
+  burstaddr = address;
+
+  while( burstaddr < address + len ) {
+    cs1[F1(FPGA_WB_DDR3_RD_CTL)] = (burstaddr & 0xFFFFFFFF) | (DDR3_BCOUNT << 32);
+    
+    for( i = 0; i < DDR3_BCOUNT; i++ ) {
+      //      memcpy(&(readback[i]),(void *) &(cs1[F1(FPGA_RB_DDR3_RD_DATA)]), 8);
+      readback[i] = cs1[F1(FPGA_RB_DDR3_RD_DATA)]; 
+    }
+
+    for( i = 0; i < DDR3_BCOUNT; i++ ) {
+      if( (i % 4) == 0 )
+	printf( "\n%08x: ", burstaddr + i * 8 );
+      printf( "%016llx ", readback[i] );
+    }
+
+    burstaddr += (DDR3_BCOUNT * 8);
+  }
+  printf( "\n" );
+  printf( "flags: " );
+  //  data = cs1[F1(FPGA_RB_DDR3_RD_STAT)];
+  memcpy(&(data),(void *) &(cs1[F1(FPGA_RB_DDR3_RD_STAT)]), 8);
+
+  if( data & 0x1000 ) 
+    printf( "cmd_err " );
+  if( data & 0x0800 )
+    printf( "cmd_empty " );
+  if( data & 0x0400 )
+    printf( "cmd_full " );
+  if( data & 0x0200 )
+    printf( "data_empty " );
+  if( data & 0x0100 )
+    printf( "data_full " );
+  printf( "fifocount: %d, readcount: %d\n", (int) data & 0x7F, (int) (data >> 16) & 0xFF );
+
+  if( ((data >> 16) & 0xFF) != DDR3_BCOUNT ) {
+    printf( "Compiler generated non-64bit access to 64bit-only region!\n" );
+  } else {
+    printf( "Compiler correctly generated 64-bit accesses\n" );
+  }
+
+}
+
+
+void ddr3_bverify(unsigned int ifd) {
+  unsigned long long *buf;
+  unsigned long long readback[DDR3_BCOUNT];
+  int i;
+  int burstaddr = 0;
+  unsigned long long data;
+  unsigned int actual;
+  volatile unsigned long long *cs1;
+  volatile unsigned short *cs0;
+
+  setup_fpga_cs1();
+
+  if(mem_32)
+    munmap(mem_32, 0xFFFF);
+  if(fd)
+    close(fd);
+
+  fd = open("/dev/mem", O_RDWR);
+  if( fd < 0 ) {
+    perror("Unable to open /dev/mem");
+    fd = 0;
+    return;
+  }
+
+  mem_32 = mmap(0, 0xffff, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0x08040000);
+  cs0 = (volatile unsigned short *)mem_32;
+  cs0[F(FPGA_W_DDR3_P3_CMD)] = 0x8000;  // set burst mode for ddr3 access
+
+  if(mem_32)
+    munmap(mem_32, 0xFFFF);
+  if(fd)
+    close(fd);
+
+  fd = open("/dev/mem", O_RDWR);
+  if( fd < 0 ) {
+    perror("Unable to open /dev/mem");
+    fd = 0;
+    return;
+  }
+
+  mem_32 = mmap(0, 0xffff, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0x0C040000);
+  cs1 = (volatile unsigned long long *)mem_32;
+
+  cs1[F1(FPGA_WB_DDR3_RD_CTL)] = 0x8000000000000000LL; // reset the interface
+  cs1[F1(FPGA_WB_DDR3_RD_CTL)] = 0x0000000000000000LL;
+
+  usleep(1000);
+
+  burstaddr = 0;
+
+  buf = (unsigned long long *) calloc(256 * 1024 * 1024 / 4, 4);
+  if( buf == NULL ) {
+    printf( "Unable to allocate 256MB shadow area. Yell at bunnie for making crappy code.\n" );
+    return;
+  }
+  actual = read(ifd, buf, 256 * 1024 * 1024);
+
+  while( burstaddr < actual ) {
+    if( (burstaddr % (1024 * 1024 * 4)) == 0 ) {
+      printf( "." );
+      fflush(stdout);
+    }
+    cs1[F1(FPGA_WB_DDR3_RD_CTL)] = (burstaddr & 0xFFFFFFFF) | (DDR3_BCOUNT << 32);
+
+    // this memcpy is necessary because:
+    // we aren't doing variable-latency reads
+    // the read request initiated from above actually takes a shy bit more time than
+    // the natural wait state of the i.MX6. When doing a large (256MB) memory dump
+    // maybe 20-30 accesses will fail. Probably unlucky with respect to when the
+    // refresh cycle has to happen.
+    //
+    // Just a couple bclk delays are needed to guarantee timing, this dummy read below
+    // is conservative but definitely meets timing requirement
+    memcpy(&(data),(void *) &(cs1[F1(FPGA_RB_DDR3_RD_STAT)]), 8); // dummy read to allow for access
+    
+    for( i = 0; i < DDR3_BCOUNT; i++ ) {
+      readback[i] = cs1[F1(FPGA_RB_DDR3_RD_DATA)]; 
+    }
+    
+    for( i = 0; i < DDR3_BCOUNT; i++ ) {
+      if(buf[(burstaddr / 8) + i] != readback[i]) {
+	printf( "\n%08x: ", (burstaddr + i) * 4);
+	printf( "+%016llx -%016llx", buf[(burstaddr / 8) + i], readback[i] );
+      }
+    }
+
+    burstaddr += (DDR3_BCOUNT * 8);
+  }
+  printf( "\n" );
+
+  //  data = cs1[F1(FPGA_RB_DDR3_RD_STAT)];
+  memcpy(&(data),(void *) &(cs1[F1(FPGA_RB_DDR3_RD_STAT)]), 8);
+
+  if( ((data >> 16) & 0xFF) != DDR3_BCOUNT ) {
+    printf( "Compiler generated non-64bit access to 64bit-only region!\n" );
+  } else {
+    printf( "Compiler correctly generated 64-bit accesses\n" );
+  }
+
+}
+
 
 void log_trace(int ofd, unsigned int records) {
   unsigned int readback[DDR3_FIFODEPTH];
@@ -2089,6 +2324,8 @@ void ddr3load(int ifd, int verify) {
   mem_32 = mmap(0, 0xffff, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0x08040000);
   cs0 = (volatile unsigned short *)mem_32;
 
+  cs0[F(FPGA_W_DDR3_P3_CMD)] &= 0x7FFF;  // clear burst mode
+
   buf = calloc(256 * 1024 * 1024 / 4, 4);
   if( buf == NULL ) {
     printf( "Unable to allocate 256MB shadow area. Yell at bunnie for making crappy code.\n" );
@@ -2436,6 +2673,7 @@ int testcs1() {
   unsigned long long retval;
   volatile unsigned long long *cs1;
   unsigned long long testbuf[16];
+  unsigned long long origbuf[16];
 
   setup_fpga_cs1();
 
@@ -2451,39 +2689,48 @@ int testcs1() {
     return 0;
   }
 
-  mem_32 = mmap(0, 0xffff, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0x0C000000);
-  cs1 = (unsigned int *)mem_32;
+  mem_32 = mmap(0, 0xffff, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0x0C040000);
+  cs1 = (unsigned long long *)mem_32;
 
-  for( i = 0; i < 16; i++ ) {
+  for( i = 0; i < 2; i++ ) {
     testbuf[i] = i | (i + 64) << 16 | (i + 8) << 32 | (i + 16) << 48 ;
   }
+  testbuf[0] = 0xdeadbeeffeedfaceLL;
+  //  testbuf[0] = 0x0LL;
+  testbuf[1] = 0x5555aaaa33339999LL;
+
 
   retval = 0;
 
-  memcpy(cs1, testbuf, 16*8);
+  //  memcpy( (void *) cs1, testbuf, 2*8);
+  origbuf[0] = testbuf[0];
+  origbuf[1] = testbuf[1];
+  cs1[0] = testbuf[0];
+  cs1[1] = testbuf[1];
 
-  memcpy(testbuf, cs1, 16*8);
+  for( i = 0; i < 2; i++ ) {
+    testbuf[i] = 0;
+  }
 
-  cs1[0] = 0xdeadbeeffeedfaceLL;
-  cs1[1] = 0x12456789abcdef01LL;
-  cs1[2] = 0xf0f0f0f0f0f0f0f0LL;
-  cs1[3] = 0x12345555aaaa9876LL;
+  memcpy(testbuf,(void *) cs1, 8);
+  memcpy(&(testbuf[1]),(void *)cs1 + 8, 8);
+  
+  for( i = 0; i < 2; i++ ) {
+    printf( "%lld: %016llx\n", i, origbuf[i] );
+    printf( "%lld: %016llx\n", i, testbuf[i] );
+  }
 
-  retval = cs1[0];
-  retval = cs1[1];
-  retval = cs1[2];
-  retval = cs1[3];
-  retval = cs1[4];
-  retval = cs1[5];
+  //  cs1[0] = 0xdeadbeeffeedfaceLL;
+  //  cs1[1] = 0x12456789abcdef01LL;
+  //  cs1[2] = 0xf0f0f0f0f0f0f0f0LL;
+  //  cs1[3] = 0x12345555aaaa9876LL;
 
-  //  for( i = 0; i < 32; i++ ) {
-  //  }
   return retval;
 }
 
 int main(int argc, char **argv) {
   unsigned int a1, a2;
-  int infile;
+  int infile = -1; 
 
   char *prog = argv[0];
   argv++;
@@ -2692,6 +2939,21 @@ int main(int argc, char **argv) {
       argv++;
       dump_ddr3(a1, a2);
     }
+    else if(!strcmp(*argv, "-ddr3bdump")) { // dump DDR3 to screen using burst-mode
+      argc--;
+      argv++;
+      if( argc != 2 ) {
+	printf( "usage -ddr3bdump <address> <count>\n" );
+	return 1;
+      }
+      a1 = strtoul(*argv, NULL, 16);
+      argc--;
+      argv++;
+      a2 = strtoul(*argv, NULL, 16);
+      argc--;
+      argv++;
+      dump_ddr3_burst(a1, a2);
+    }
     else if(!strcmp(*argv, "-bangtest")) { // test bitbang driver routines for NAND
       argc--;
       argv++;
@@ -2753,6 +3015,21 @@ int main(int argc, char **argv) {
       argc--;
       argv++;
       ddr3load(infile, 1);
+    } else if(!strcmp(*argv, "-ddr3bverify")) { // verify romulator image integrity
+      argc--;
+      argv++;
+      if( argc != 1 ) {
+	printf( "usage -ddr3bverify <file>\n" );
+	return 1;
+      }
+      infile = open(*argv, O_RDONLY );
+      if( infile == -1 ) {
+	printf("Unable to open %s\n", *argv );
+	return 1;
+      }
+      argc--;
+      argv++;
+      ddr3_bverify(infile);
     } else if(!strcmp(*argv, "-romreset")) {
       argc--;
       argv++;
