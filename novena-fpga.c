@@ -2728,6 +2728,202 @@ int testcs1() {
   return retval;
 }
 
+void logsd() {
+  unsigned int s;
+  unsigned int ns;
+  unsigned int log_entries;
+  volatile unsigned short *cs0;
+
+  setup_fpga();
+  //  setup_fpga_cs1();
+
+  if(mem_32)
+    munmap(mem_32, 0xFFFF);
+  if(fd)
+    close(fd);
+
+  fd = open("/dev/mem", O_RDWR);
+  if( fd < 0 ) {
+    perror("Unable to open /dev/mem");
+    fd = 0;
+    return;
+  }
+
+  mem_32 = mmap(0, 0xffff, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0x08040000);
+  cs0 = (volatile unsigned short *)mem_32;
+
+
+  cs0[FPGA_MAP(FPGA_W_LOG_CMD)] =  0x1;  // reset the log
+  cs0[FPGA_MAP(FPGA_W_LOG_CMD)] = 0x0;
+  usleep(10000);
+
+  cs0[FPGA_MAP(FPGA_W_LOG_CMD)] = 0x2; // run the log
+
+  sleep(5);
+  
+  cs0[FPGA_MAP(FPGA_W_LOG_CMD)] = 0x0; // stop the log
+  
+  log_entries = cs0[F(FPGA_R_LOG_ENTRY_L)];
+  log_entries |= (cs0[F(FPGA_R_LOG_ENTRY_H)] << 16);
+  
+  printf( "found %d entries\n", log_entries );
+  
+  printf( "status is %x\n", cs0[F(FPGA_R_LOG_STAT)] );
+
+  ns = cs0[FPGA_MAP(FPGA_R_LOG_TIME_NSL)] & 0xFFFF;
+  ns |= cs0[FPGA_MAP(FPGA_R_LOG_TIME_NSH)] << 16;
+  s = cs0[FPGA_MAP(FPGA_R_LOG_TIME_SL)] & 0xFFFF;
+  s |= cs0[FPGA_MAP(FPGA_R_LOG_TIME_SH)] << 16;
+  printf( "time is: %us.%uns\n", s, ns );
+  
+}
+
+void logdepth() {
+  unsigned int s;
+  unsigned int ns;
+  unsigned int log_entries;
+  volatile unsigned short *cs0;
+
+  setup_fpga();
+  //  setup_fpga_cs1();
+
+  if(mem_32)
+    munmap(mem_32, 0xFFFF);
+  if(fd)
+    close(fd);
+
+  fd = open("/dev/mem", O_RDWR);
+  if( fd < 0 ) {
+    perror("Unable to open /dev/mem");
+    fd = 0;
+    return;
+  }
+
+  mem_32 = mmap(0, 0xffff, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0x08040000);
+  cs0 = (volatile unsigned short *)mem_32;
+
+  log_entries = cs0[F(FPGA_R_LOG_ENTRY_L)];
+  log_entries |= (cs0[F(FPGA_R_LOG_ENTRY_H)] << 16);
+  
+  printf( "found %d entries\n", log_entries );
+
+  printf( "status is 0x%x, runstate is 0x%x\n", cs0[F(FPGA_R_LOG_STAT)], 
+	  cs0[FPGA_MAP(FPGA_W_LOG_CMD)] );
+
+  ns = cs0[FPGA_MAP(FPGA_R_LOG_TIME_NSL)] & 0xFFFF;
+  ns |= cs0[FPGA_MAP(FPGA_R_LOG_TIME_NSH)] << 16;
+  s = cs0[FPGA_MAP(FPGA_R_LOG_TIME_SL)] & 0xFFFF;
+  s |= cs0[FPGA_MAP(FPGA_R_LOG_TIME_SH)] << 16;
+  printf( "time is: %us.%uns\n", s, ns );
+  
+}
+
+void ddr3_logdump(unsigned int ofd, unsigned int entries) {
+  unsigned long long *buf;
+  unsigned long long readback[DDR3_BCOUNT];
+  int i;
+  int burstaddr = 0;
+  unsigned long long data;
+
+  volatile unsigned long long *cs1;
+  volatile unsigned short *cs0;
+
+  setup_fpga();
+  setup_fpga_cs1();
+
+  if(mem_32)
+    munmap(mem_32, 0xFFFF);
+  if(fd)
+    close(fd);
+
+  fd = open("/dev/mem", O_RDWR);
+  if( fd < 0 ) {
+    perror("Unable to open /dev/mem");
+    fd = 0;
+    return;
+  }
+
+  mem_32 = mmap(0, 0xffff, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0x08040000);
+  cs0 = (volatile unsigned short *)mem_32;
+  cs0[F(FPGA_W_DDR3_P3_CMD)] = 0x8000;  // set burst mode for ddr3 access
+
+  if( entries == 0 ) {
+    entries = cs0[F(FPGA_R_LOG_ENTRY_L)];
+    entries |= (cs0[F(FPGA_R_LOG_ENTRY_H)] << 16);
+  }
+
+
+  if(mem_32)
+    munmap(mem_32, 0xFFFF);
+  if(fd)
+    close(fd);
+
+  fd = open("/dev/mem", O_RDWR);
+  if( fd < 0 ) {
+    perror("Unable to open /dev/mem");
+    fd = 0;
+    return;
+  }
+
+  mem_32 = mmap(0, 0xffff, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0x0C040000);
+  cs1 = (volatile unsigned long long *)mem_32;
+
+  cs1[F1(FPGA_WB_DDR3_RD_CTL)] = 0x8000000000000000LL; // reset the interface
+  cs1[F1(FPGA_WB_DDR3_RD_CTL)] = 0x0000000000000000LL;
+
+  usleep(1000);
+
+  burstaddr = 0;
+
+  buf = (unsigned long long *) calloc(256 * 1024 * 1024 / 4, 4);
+  if( buf == NULL ) {
+    printf( "Unable to allocate 256MB shadow area. Yell at bunnie for making crappy code.\n" );
+    return;
+  }
+
+  while( burstaddr < entries ) {
+    if( (burstaddr % (1024 * 1024 * 4)) == 0 ) {
+      printf( "." );
+      fflush(stdout);
+    }
+    cs1[F1(FPGA_WB_DDR3_RD_CTL)] = (burstaddr & 0xFFFFFFFF) | (DDR3_BCOUNT << 32);
+
+    // this memcpy is necessary because:
+    // we aren't doing variable-latency reads
+    // the read request initiated from above actually takes a shy bit more time than
+    // the natural wait state of the i.MX6. When doing a large (256MB) memory dump
+    // maybe 20-30 accesses will fail. Probably unlucky with respect to when the
+    // refresh cycle has to happen.
+    //
+    // Just a couple bclk delays are needed to guarantee timing, this dummy read below
+    // is conservative but definitely meets timing requirement
+    memcpy(&(data),(void *) &(cs1[F1(FPGA_RB_DDR3_RD_STAT)]), 8); // dummy read to allow for access
+    
+    for( i = 0; i < DDR3_BCOUNT; i++ ) {
+      readback[i] = cs1[F1(FPGA_RB_DDR3_RD_DATA)]; 
+    }
+    
+    for( i = 0; i < DDR3_BCOUNT; i++ ) {
+      buf[(burstaddr / 8) + i] = readback[i];
+    }
+
+    burstaddr += (DDR3_BCOUNT * 8);
+  }
+  printf( "\n" );
+
+  //  data = cs1[F1(FPGA_RB_DDR3_RD_STAT)];
+  memcpy(&(data),(void *) &(cs1[F1(FPGA_RB_DDR3_RD_STAT)]), 8);
+
+  if( ((data >> 16) & 0xFF) != DDR3_BCOUNT ) {
+    printf( "Compiler generated non-64bit access to 64bit-only region!\n" );
+  } else {
+    printf( "Compiler correctly generated 64-bit accesses\n" );
+  }
+
+  write( ofd, buf, entries );
+}
+
+
 int main(int argc, char **argv) {
   unsigned int a1, a2;
   int infile = -1; 
@@ -3094,6 +3290,41 @@ int main(int argc, char **argv) {
       argc--;
       argv++;
       testcs1();
+    }
+    else if(!strcmp(*argv, "-logsd")) {
+      argc--;
+      argv++;
+      logsd();
+    }
+    else if(!strcmp(*argv, "-logdepth")) {
+      argc--;
+      argv++;
+      logdepth();
+    }
+    else if(!strcmp(*argv, "-logbdump")) {
+      argc--;
+      argv++;
+      if( argc == 0 ) {
+	printf( "usage -logbdump <filename> <entries>\n" );
+	return 1;
+      }
+      infile = open(*argv, O_CREAT | O_WRONLY | O_TRUNC, 0644 );
+      if( infile == -1 ) {
+	printf("Unable to open %s\n", *argv );
+	return 1;
+      }
+      argc--;
+      argv++;
+      if( argc == 2 ) {
+	a1 = strtoul(*argv, NULL, 10);
+	argc--;
+	argv++;
+      } else {
+	a1 = 0;
+      }
+
+      ddr3_logdump(infile, a1);
+      close(infile);
     }
     else {
       print_usage(prog);
