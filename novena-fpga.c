@@ -11,6 +11,8 @@
 #include <time.h>
 #include "gpio.h"
 #include "sd.h"
+#include <linux/i2c-dev.h>
+#include <sys/ioctl.h>
 
 /** Definitions for Novena EIM interface */
 #define CS_PIN    GPIO_IS_EIM | 3
@@ -2699,7 +2701,6 @@ int testcs1() {
   //  testbuf[0] = 0x0LL;
   testbuf[1] = 0x5555aaaa33339999LL;
 
-
   retval = 0;
 
   //  memcpy( (void *) cs1, testbuf, 2*8);
@@ -2923,6 +2924,107 @@ void ddr3_logdump(unsigned int ofd, unsigned int entries) {
   write( ofd, buf, entries );
 }
 
+int analysis1() {
+  unsigned int *cs1_mem;
+  int memfd;
+  volatile unsigned long long *cs1;
+  unsigned long long testWord;
+  int i2cfd;
+  char i2cbuf[256]; // meh too big but meh
+  int i2c_read;
+  int address = 0x1E; // device address of the FPGA on I2C bus 2 (hardware interface I2C3)
+  int i;
+  unsigned int record;
+  
+  i2cfd = open("/dev/i2c-2", O_RDWR);
+  if( i2cfd < 0 ) {
+    perror("Unable to open /dev/i2c-2\n");
+    i2cfd = 0;
+    return 0;
+  }
+  if( ioctl( i2cfd, I2C_SLAVE, address) < 0 ) {
+    perror("Unable to set I2C slave device 0x1E\n");
+    return 0;
+  }
+  
+  setup_fpga();
+  setup_fpga_cs1();
+  
+  memfd = open("/dev/mem", O_RDWR );
+  if( memfd < 0 ) {
+    perror("Unable to open /dev/mem a second time\n");
+    memfd = 0;
+    return 0;
+  }
+  
+  cs1_mem = mmap(0, 0xffff, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0x0C040000 );
+  cs1 = (unsigned long long *)cs1_mem;
+
+  // run a quick test to make sure the interface is working
+  printf( "interface test: (should see 0xaa the 0x55)\n" );
+  i2cbuf[0] = 0x0; i2cbuf[1] = 0xAA;
+  if( write(i2cfd, i2cbuf, 2) != 2 ) {
+    perror("i2c write failed\n");
+  }
+
+  i2c_read = i2c_smbus_read_byte_data(i2cfd, 0x40);
+  printf( "read back %02x\n", i2c_read & 0xFF );
+
+  i2cbuf[0] = 0x0; i2cbuf[1] = 0x55;
+  if( write(i2cfd, i2cbuf, 2) != 2 ) {
+    perror("i2c write failed\n");
+  }
+
+  i2c_read = i2c_smbus_read_byte_data(i2cfd, 0x40);
+  printf( "read back %02x\n", i2c_read & 0xFF );
+  fflush(stdout); // make sure these tests are flushed to the screen
+
+  /// now we are all ready. First, reset the log...
+  i2cbuf[0] = 0x2; i2cbuf[1] = 0x2; // reset the log
+  write(i2cfd, i2cbuf, 2);
+  
+  i2cbuf[0] = 0x2; i2cbuf[1] = 0x1; // set the log to run
+  write(i2cfd, i2cbuf, 2);
+
+  // kick off a test poke
+  testWord = 0xfacebabebeefbad5LL;
+  *cs1 = testWord;
+  testWord = 0x5a5aa5a5ceceececLL;
+  *cs1 = testWord;
+
+  // now read back from the log
+  for( i = 0; i < 1024; i++ ) { // the log is 1024 entries long
+    record = 0;
+    i2c_read = i2c_smbus_read_byte_data(i2cfd,0x44);
+    record = i2c_read & 0xFF;
+    i2c_read = i2c_smbus_read_byte_data(i2cfd,0x45);
+    record |= (i2c_read & 0xFF) << 8;
+    i2c_read = i2c_smbus_read_byte_data(i2cfd,0x46);
+    record |= (i2c_read & 0xFF) << 16;
+
+    if( i > 480 && i < 600 ) {
+      printf( "%04d: %08x ", i, record );
+      if( record & 0x200000 )
+	printf( " ADV" );
+      else
+	printf( "    " );
+      if( record & 0x100000 )
+	printf( " RD " );
+      else
+	printf( " WR " );
+      
+      if( record & 0x080000 ) 
+	printf( "     " );
+      else
+	printf( " CS1 " );
+    
+      printf( " %01x ", (record >> 16) & 0x7 );
+      printf( " %04x\n", record & 0xFFFF );
+    }
+  }
+
+  return 0;
+}
 
 int main(int argc, char **argv) {
   unsigned int a1, a2;
@@ -3325,8 +3427,11 @@ int main(int argc, char **argv) {
 
       ddr3_logdump(infile, a1);
       close(infile);
-    }
-    else {
+    } else if(!strcmp(*argv, "-a1")) { // ever-so-helpful name for "analysis 1 -- trying to figure out if bursts to CS1 work or not"
+      argc--;
+      argv++;
+      analysis1();
+    } else {
       print_usage(prog);
       return 1;
     }
