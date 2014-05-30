@@ -9,7 +9,7 @@ echo 1 > /sys/class/gpio/gpio135/value
                                       
 echo "configuring FPGA"               
                                       
-dd if=/home/root/novena_fpga.bit of=/dev/spidev32766.0 bs=128
+dd if=/home/bunnie/code/novena-fpga-drivers/novena_fpga.bit of=/dev/spidev2.0 bs=128
                                                              
 echo "turning on clock to FPGA"                              
 devmem2 0x020c8160 w 0x00000D2B

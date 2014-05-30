@@ -2924,6 +2924,94 @@ void ddr3_logdump(unsigned int ofd, unsigned int entries) {
 }
 
 
+void bushing(int ifd) {
+  struct sd_state *state;
+  unsigned char testdat[TESTLEN];
+  unsigned int s;
+  unsigned int ns;
+  double timeval;
+  unsigned int log_entries;
+  unsigned short log_stat;
+  volatile unsigned short *cs0;
+
+  if(mem_32)
+    munmap(mem_32, 0xFFFF);
+
+  if(fd)
+    close(fd);
+
+  fd = open("/dev/mem", O_RDWR);
+
+  if( fd < 0 ) {
+    perror("Unable to open /dev/mem");
+    fd = 0;
+    return;
+  }
+
+  mem_32 = mmap(0, 0xffff, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0x08040000);
+  cs0 = (volatile unsigned short *)mem_32;
+
+  cs0[FPGA_MAP(FPGA_W_LOG_CMD)] =  0x1;  // reset the log
+  cs0[FPGA_MAP(FPGA_W_LOG_CMD)] = 0x0;
+  usleep(10000);
+
+
+  // write some data in
+  printf( "log run state: %d\n",  cs0[FPGA_MAP(FPGA_W_LOG_CMD)] );
+  cs0[FPGA_MAP(FPGA_W_LOG_CMD)] = 0x2; // run the log
+  printf( "log run state: %d\n",  cs0[FPGA_MAP(FPGA_W_LOG_CMD)] );
+
+  sleep(5);  // how long you want to log for
+
+  printf( "log run state: %d\n",  cs0[FPGA_MAP(FPGA_W_LOG_CMD)] );
+  cs0[FPGA_MAP(FPGA_W_LOG_CMD)] = 0x0; // stop the log
+  printf( "log run state: %d\n",  cs0[FPGA_MAP(FPGA_W_LOG_CMD)] );
+
+
+  ns = cs0[FPGA_MAP(FPGA_R_LOG_TIME_NSL)] & 0xFFFF;
+  ns |= cs0[FPGA_MAP(FPGA_R_LOG_TIME_NSH)] << 16;
+  s = cs0[FPGA_MAP(FPGA_R_LOG_TIME_SL)] & 0xFFFF;
+  s |= cs0[FPGA_MAP(FPGA_R_LOG_TIME_SH)] << 16;
+
+
+  timeval = (double) s;
+  timeval = timeval + ((double) ns / 1000000000);
+
+
+  printf( "time according to the FPGA: %lf seconds\n", timeval );
+  log_entries = cs0[FPGA_MAP(FPGA_R_LOG_ENTRY_L)] & 0xFFFF;
+  log_entries |= cs0[FPGA_MAP(FPGA_R_LOG_ENTRY_H)] << 16;
+  log_stat = cs0[FPGA_MAP(FPGA_R_LOG_STAT)];
+
+
+  printf( "log entries: %u\n", log_entries );
+  if( log_stat & 0x1 )
+    printf( "Note: data fifo overflowed\n" );
+
+  if( log_stat & 0x2 )
+    printf( "Note: command fifo overflowed\n" );
+
+  if( log_stat & 0x4 )
+    printf( "Note: extended command fifo underflowed\n" );
+
+  if( log_stat & 0x8 )
+    printf( "Note: extended command fifo overflowed\n" );
+
+  printf( "Max command fifo depth: %d\n", (log_stat >> 4) & 0x1F );
+  printf( "Max data fifo depth: %d\n", (log_stat >> 9) & 0x7F );
+
+  log_stat = cs0[FPGA_MAP(FPGA_R_LOG_DEBUG)];
+
+  if( log_stat & 0x1 )
+    printf( "Note: data fifo currently shows full\n" );
+
+  else
+    printf( "Note: data fifo currently shows not full\n" );
+
+  log_dump(ifd, log_entries, 1);
+
+}
+
 int main(int argc, char **argv) {
   unsigned int a1, a2;
   int infile = -1; 
@@ -2931,6 +3019,8 @@ int main(int argc, char **argv) {
   char *prog = argv[0];
   argv++;
   argc--;
+
+  setup_fpga();
 
   if(!argc) {
     print_usage(prog);
@@ -3325,6 +3415,22 @@ int main(int argc, char **argv) {
 
       ddr3_logdump(infile, a1);
       close(infile);
+    }
+    else if(!strcmp(*argv, "-bushing")) {
+      argc--;
+      argv++;
+      if( argc == 0 ) {
+	printf( "usage -bushing <filename>\n" );
+	return 1;
+      }
+      infile = open(*argv, O_CREAT | O_WRONLY | O_TRUNC, 0644 );
+      if( infile == -1 ) {
+	printf("Unable to open %s\n", *argv );
+	return 1;
+      }
+      argc--;
+      argv++;
+      bushing(infile);
     }
     else {
       print_usage(prog);
