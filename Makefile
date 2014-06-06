@@ -1,4 +1,4 @@
-SOURCES=sd.c novena-fpga.c packet.c sd-support.c gpio.c eim.c crc-16.c
+SOURCES=novena-fpga.c gpio.c eim.c 
 OBJECTS=$(SOURCES:.c=.o)
 EXEC=novena-fpga
 MY_CFLAGS += -Wall -O0 -g
